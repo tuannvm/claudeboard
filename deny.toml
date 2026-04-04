@@ -10,9 +10,9 @@ vulnerability = "deny"
 # The lint level for unmaintained crates
 unmaintained = "all"
 # The lint level for crates that have been yanked from their source registry
-yanked = "all"
+yanked = "warn"
 # The lint level for crates with security notices
-notice = "all"
+notice = "warn"
 
 [licenses]
 # The lint level for crates which do not have a detectable license
