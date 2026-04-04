@@ -2,6 +2,9 @@
 name = "claude-watch"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "A TUI for watching Claude Code sessions"
+repository = "https://github.com/tuannvm/claude-watch"
 
 [dependencies]
 ratatui = "0.26"
