@@ -72,7 +72,7 @@ Similar to mcp-trino's setup for @claude mentions in PRs/issues
 
 ## Architecture
 
-```
+```text
 /loop <interval>                   ← outer: recurring heartbeat
   └─ /ralph-wiggum:ralph-loop     ← inner: self-referential iteration
        └─ /codex                  ← reviewer: each iteration
