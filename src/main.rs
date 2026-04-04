@@ -916,14 +916,12 @@ fn render_tmux_panel(f: &mut Frame, area: Rect, state: &AppState) {
         }
 
         for (window_name, window_index, window_panes) in panes_by_window.into_iter() {
-            // Only add window header if multiple windows exist
-            if seen_windows.len() > 1 {
-                tree.push(TmuxTreeEntry::Window {
-                    session: session.name.clone(),
-                    name: window_name.clone(),
-                    index: window_index.clone(),
-                });
-            }
+            // Always add window header for clarity
+            tree.push(TmuxTreeEntry::Window {
+                session: session.name.clone(),
+                name: window_name.clone(),
+                index: window_index.clone(),
+            });
 
             // Panes under this window
             for pane in window_panes.iter() {
@@ -1078,7 +1076,7 @@ fn render_tmux_panel(f: &mut Frame, area: Rect, state: &AppState) {
 
                 let bg = if is_selected { colors::SURFACE } else { colors::BG };
                 let text_color = if is_selected {
-                    colors::PRIMARY
+                    colors::ACCENT
                 } else if has_match {
                     colors::GREEN
                 } else {
@@ -1089,19 +1087,25 @@ fn render_tmux_panel(f: &mut Frame, area: Rect, state: &AppState) {
                 // is_claude only affects bullet color (● vs ○)
                 let label = if let Some(r) = &repo {
                     if let Some(b) = &branch {
-                        format!("[{}] {} - {}", pane_label, r, b)
+                        format!("[{}] {} @{}", pane_label, r, b)
                     } else {
-                        format!("[{}] {} - worktree", pane_label, r)
+                        format!("[{}] {} (worktree)", pane_label, r)
                     }
                 } else {
-                    format!("[{}]", pane_label)
+                    format!("[{}] %{}", pane_label, pane_key.pane.replace("%", ""))
+                };
+
+                let label_style = if is_selected {
+                    Style::default().fg(text_color).bg(bg).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(text_color).bg(bg)
                 };
 
                 lines.push(Line::from(vec![
                     Span::raw(tree_char).set_style(Style::default().fg(colors::BORDER).bg(bg)),
                     Span::raw(marker).set_style(Style::default().fg(marker_color).bg(bg)),
                     Span::raw(" ").set_style(Style::default().bg(bg)),
-                    Span::raw(label).set_style(Style::default().fg(text_color).bg(bg)),
+                    Span::raw(label).set_style(label_style),
                 ]));
             }
         }
@@ -1447,7 +1451,7 @@ fn render_session_metadata(f: &mut Frame, area: Rect, state: &AppState) {
                 lines.push(Line::from(vec![
                     Span::raw("  cwd: ").set_style(Style::default().fg(colors::SECONDARY)),
                     {
-                        let cwd = if pane.cwd.len() > 35 {
+                        let cwd = if pane.cwd.chars().count() > 35 {
                             format!("...{}", truncate_from_end(&pane.cwd, 32))
                         } else {
                             pane.cwd.clone()
@@ -1459,10 +1463,14 @@ fn render_session_metadata(f: &mut Frame, area: Rect, state: &AppState) {
                     Span::raw("  cmd: ").set_style(Style::default().fg(colors::SECONDARY)),
                     Span::raw(pane.running_cmd.as_deref().unwrap_or("—")).set_style(Style::default().fg(colors::GREEN)),
                 ]));
+                lines.push(Line::from(vec![
+                    Span::raw("  pane: ").set_style(Style::default().fg(colors::SECONDARY)),
+                    Span::raw(&pane.pane_id).set_style(Style::default().fg(colors::CYAN)),
+                ]));
             }
             lines.push(Line::from(vec![]));
-            lines.push(Line::from(vec![Span::raw("  token/queue data requires JSONL").set_style(Style::default().fg(colors::SECONDARY))]));
-            lines.push(Line::from(vec![Span::raw("  match (cwd or project name)").set_style(Style::default().fg(colors::SECONDARY))]));
+            lines.push(Line::from(vec![Span::raw("  sessions matched by cwd or").set_style(Style::default().fg(colors::SECONDARY))]));
+            lines.push(Line::from(vec![Span::raw("  project name in JSONL logs").set_style(Style::default().fg(colors::SECONDARY))]));
 
             let para = Paragraph::new(lines).set_style(Style::default().bg(colors::BG));
             f.render_widget(para, inner);
