@@ -1248,17 +1248,18 @@ fn render_live_pane(f: &mut Frame, area: Rect, state: &AppState) {
                 let max_lines = (inner.height as usize).saturating_sub(3).max(1);
                 let max_chars = (inner.width as usize).saturating_sub(4).max(10);
                 for line_text in lines.iter().rev().take(max_lines).rev() {
-                    let display: String = if line_text.chars().count() > max_chars {
-                        let mut chars = 0;
-                        let end = line_text.char_indices()
-                            .take_while(|(_, _c)| {
-                                chars += 1;
-                                chars <= max_chars.saturating_sub(3)
-                            })
-                            .last()
-                            .map(|(i, _)| i + 1)
-                            .unwrap_or(0);
-                        format!("{}...", &line_text[..end])
+                    let display = if line_text.chars().count() > max_chars {
+                        let limit = max_chars.saturating_sub(3);
+                        let mut end_byte = line_text.len();
+                        let mut char_count = 0;
+                        for (byte_idx, _) in line_text.char_indices() {
+                            if char_count >= limit {
+                                end_byte = byte_idx;
+                                break;
+                            }
+                            char_count += 1;
+                        }
+                        format!("{}...", &line_text[..end_byte])
                     } else {
                         line_text.clone()
                     };
