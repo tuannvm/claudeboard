@@ -189,6 +189,7 @@ fn is_coding_agent(pane: &TmuxPane) -> bool {
 #[derive(Debug, Clone)]
 pub struct TmuxSession {
     pub name: String,
+    pub group: Option<String>, // None means standalone (no group), Some means part of a group
     pub panes: Vec<TmuxPane>,
 }
 
@@ -530,39 +531,61 @@ fn parse_tmux_workspace(socket: &Option<String>) -> Option<TmuxWorkspace> {
         None => vec![],
     };
 
+    // Get session names and their groups
     let mut cmd = std::process::Command::new("tmux");
     for arg in &socket_args {
         cmd.arg(arg);
     }
-    cmd.args(["list-sessions", "-F", "#{session_name}"]);
+    cmd.args(["list-sessions", "-F", "#{session_name}|#{session_group}"]);
     let output = match cmd.output() {
         Ok(o) if o.status.success() => o,
         _ => return None,
     };
 
-    let session_names: Vec<String> = String::from_utf8_lossy(&output.stdout)
+    let session_infos: Vec<(String, Option<String>)> = String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter(|l| !l.is_empty())
-        .map(|s| s.to_string())
+        .map(|line| {
+            let parts: Vec<&str> = line.splitn(2, '|').collect();
+            let name = parts[0].to_string();
+            // group is the session group - if session belongs to a group different from its name,
+            // it's a secondary session and should be filtered out
+            let group = parts.get(1).filter(|g| !g.is_empty()).map(|g| g.to_string());
+            (name, group)
+        })
         .collect();
 
-    if session_names.is_empty() {
+    if session_infos.is_empty() {
         return Some(TmuxWorkspace {
             sessions: vec![],
             total_panes: 0,
         });
     }
 
+    // Filter to only primary sessions: either standalone sessions (no group) or the first session in each group
+    // Secondary sessions (group != name) share windows with the primary and should be hidden
+    let primary_sessions: Vec<(String, Option<String>)> = session_infos
+        .into_iter()
+        .filter(|(name, group): &(String, Option<String>)| {
+            // Keep if: group is None (standalone) OR group == name (primary session)
+            // Skip if: group is Some and group != name (secondary session)
+            match group {
+                Some(g) if g.as_str() != *name => false,
+                _ => true,
+            }
+        })
+        .collect();
+
     let mut total_panes = 0;
-    let sessions: Vec<TmuxSession> = session_names
+    let sessions: Vec<TmuxSession> = primary_sessions
         .iter()
-        .map(|session_name| {
+        .map(|(session_name, group)| {
             let mut cmd = std::process::Command::new("tmux");
             for arg in &socket_args {
                 cmd.arg(arg);
             }
             cmd.args([
-                "list-panes", "-a", "-t", session_name, "-F",
+                "list-panes", "-t", session_name, "-F",
                 "#{pane_id}|#{window_name}|#{session_name}|#{pane_current_path}|#{pane_current_command}|#{pane_title}|#{pane_dead}",
             ]);
 
@@ -570,6 +593,7 @@ fn parse_tmux_workspace(socket: &Option<String>) -> Option<TmuxWorkspace> {
                 Ok(o) if o.status.success() => o,
                 _ => return TmuxSession {
                     name: session_name.clone(),
+                    group: group.clone(),
                     panes: vec![],
                 },
             };
@@ -611,6 +635,7 @@ fn parse_tmux_workspace(socket: &Option<String>) -> Option<TmuxWorkspace> {
             total_panes += panes.len();
             TmuxSession {
                 name: session_name.clone(),
+                group: group.clone(),
                 panes,
             }
         })
@@ -856,9 +881,25 @@ fn render_tmux_panel(f: &mut Frame, area: Rect, state: &AppState) {
                     })
                     .unwrap_or((None, None));
 
+                // Build pane label: use running_cmd (version like "2.1.89" or "claude-watch") as primary,
+                // title as secondary info in parentheses if different
+                let pane_label = if let Some(ref cmd) = pane.running_cmd {
+                    if let Some(ref title) = pane.pane_title {
+                        if title.as_str() != pane.window_name && !title.contains(cmd) {
+                            format!("{} ({})", cmd, title)
+                        } else {
+                            cmd.clone()
+                        }
+                    } else {
+                        cmd.clone()
+                    }
+                } else {
+                    pane.pane_title.clone().unwrap_or_else(|| pane.window_name.clone())
+                };
+
                 tree.push(TmuxTreeEntry::Pane {
                     pane_key,
-                    pane_label: pane.pane_title.clone().unwrap_or_else(|| pane.window_name.clone()),
+                    pane_label,
                     repo,
                     branch,
                 });
