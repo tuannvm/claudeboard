@@ -6,7 +6,7 @@ use parking_lot::RwLock;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 use ratatui::style::Styled;
 use serde::Deserialize;
@@ -15,6 +15,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::interval;
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+fn truncate_from_end(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        return s.to_string();
+    }
+    s.chars().rev().take(max_chars).collect::<Vec<_>>().into_iter().rev().collect()
+}
 
 // ============================================================================
 // CLI
@@ -142,6 +154,7 @@ pub struct PaneKey {
 pub struct TmuxPane {
     pub pane_id: String,
     pub window_name: String,
+    pub window_index: String,
     pub session_name: String,
     pub cwd: String,
     pub running_cmd: Option<String>,
@@ -150,9 +163,8 @@ pub struct TmuxPane {
 }
 
 /// Check if a pane is running a coding agent (Claude Code, Codex, or Gemini)
-/// A pane must have its running_cmd indicate an actual coding agent process.
-/// The title alone is NOT sufficient - panes can have "✳ Claude Code" as a title
-/// but still be running zsh.
+/// Uses only the running_cmd (foreground process) - does NOT use pane_title.
+/// This relies on the actual command binary name being detected.
 fn is_coding_agent(pane: &TmuxPane) -> bool {
     // Dead panes are not running anything
     if pane.pane_dead {
@@ -163,16 +175,22 @@ fn is_coding_agent(pane: &TmuxPane) -> bool {
     if let Some(ref cmd) = pane.running_cmd {
         let cmd_lower = cmd.to_lowercase();
 
-        // Known coding agent commands
-        let is_agent_cmd = cmd_lower.contains("claude")
-            || cmd_lower.contains("codex")
-            || cmd_lower.contains("gemini")
-            || cmd_lower.contains("anthropic");
+        // Known coding agent commands (check the binary name, not path)
+        let cmd_basename = std::path::Path::new(cmd)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.to_lowercase())
+            .unwrap_or(cmd_lower);
+
+        let is_agent_cmd = cmd_basename.contains("claude")
+            || cmd_basename.contains("codex")
+            || cmd_basename.contains("gemini")
+            || cmd_basename.contains("anthropic");
 
         // Claude Code versions are like "2.1.89", "3.5.0" etc
-        // Check for pattern: number.number or number.number.number (allow single decimal)
+        // Check for pattern: number.number (allow multiple parts)
         let is_version = {
-            let parts: Vec<&str> = cmd.split('.').collect();
+            let parts: Vec<&str> = cmd_basename.split('.').collect();
             parts.len() >= 2
                 && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit()))
                 && parts[0].chars().all(|c| c.is_ascii_digit())
@@ -212,6 +230,8 @@ pub struct AppState {
     pub aggregated_tokens: AggregatedTokens,
     // Refresh
     pub refresh_countdown: u64,
+    // tmux socket (needed for live pane capture)
+    pub tmux_socket: Option<String>,
 }
 
 // ============================================================================
@@ -580,16 +600,18 @@ fn parse_tmux_workspace(socket: &Option<String>) -> Option<TmuxWorkspace> {
     let sessions: Vec<TmuxSession> = primary_sessions
         .iter()
         .map(|(session_name, group)| {
-            let mut cmd = std::process::Command::new("tmux");
-            for arg in &socket_args {
-                cmd.arg(arg);
-            }
-            cmd.args([
-                "list-panes", "-t", session_name, "-F",
-                "#{pane_id}|#{window_name}|#{session_name}|#{pane_current_path}|#{pane_current_command}|#{pane_title}|#{pane_dead}",
-            ]);
+            // NOTE: tmux list-panes -t session only returns panes from the CURRENT window,
+            // not all windows in the session. We must iterate over each window.
+            let mut all_panes: Vec<TmuxPane> = Vec::new();
 
-            let output = match cmd.output() {
+            // First get all windows in this session
+            let mut list_windows_cmd = std::process::Command::new("tmux");
+            for arg in &socket_args {
+                list_windows_cmd.arg(arg);
+            }
+            list_windows_cmd.args(["list-windows", "-t", session_name, "-F", "#{window_index}"]);
+
+            let windows_output = match list_windows_cmd.output() {
                 Ok(o) if o.status.success() => o,
                 _ => return TmuxSession {
                     name: session_name.clone(),
@@ -598,45 +620,74 @@ fn parse_tmux_workspace(socket: &Option<String>) -> Option<TmuxWorkspace> {
                 },
             };
 
-            let panes: Vec<TmuxPane> = String::from_utf8_lossy(&output.stdout)
+            let window_indices: Vec<String> = String::from_utf8_lossy(&windows_output.stdout)
                 .lines()
-                .filter_map(|line| {
-                    let parts: Vec<&str> = line.splitn(7, '|').collect();
-                    if parts.len() < 6 {
-                        return None;
-                    }
-                    let pane_id = parts[0].to_string();
-                    let window_name = parts[1].to_string();
-                    let session_name_str = parts[2].to_string();
-                    let cwd = parts[3].to_string();
-                    let running_cmd = if parts[4].is_empty() || parts[4] == "0" {
-                        None
-                    } else {
-                        Some(parts[4].to_string())
-                    };
-                    let pane_title = if parts.len() >= 6 && !parts[5].is_empty() {
-                        Some(parts[5].to_string())
-                    } else {
-                        None
-                    };
-                    let pane_dead = parts.get(6).map(|s| *s == "1").unwrap_or(false);
-                    Some(TmuxPane {
-                        pane_id,
-                        window_name,
-                        session_name: session_name_str,
-                        cwd,
-                        running_cmd,
-                        pane_title,
-                        pane_dead,
-                    })
-                })
+                .filter(|l| !l.is_empty())
+                .map(|s| s.to_string())
                 .collect();
 
-            total_panes += panes.len();
+            // For each window, get all panes
+            for window_idx in window_indices {
+                let target = format!("{}:{}", session_name, window_idx);
+
+                let mut list_panes_cmd = std::process::Command::new("tmux");
+                for arg in &socket_args {
+                    list_panes_cmd.arg(arg);
+                }
+                list_panes_cmd.args([
+                    "list-panes", "-t", &target, "-F",
+                    "#{pane_id}|#{window_name}|#{window_index}|#{session_name}|#{pane_current_path}|#{pane_current_command}|#{pane_title}|#{pane_dead}",
+                ]);
+
+                let output = match list_panes_cmd.output() {
+                    Ok(o) if o.status.success() => o,
+                    _ => continue,
+                };
+
+                let panes: Vec<TmuxPane> = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter_map(|line| {
+                        let parts: Vec<&str> = line.splitn(8, '|').collect();
+                        if parts.len() < 7 {
+                            return None;
+                        }
+                        let pane_id = parts[0].to_string();
+                        let window_name = parts[1].to_string();
+                        let window_index = parts[2].to_string();
+                        let session_name_str = parts[3].to_string();
+                        let cwd = parts[4].to_string();
+                        let running_cmd = if parts[5].is_empty() || parts[5] == "0" {
+                            None
+                        } else {
+                            Some(parts[5].to_string())
+                        };
+                        let pane_title = if !parts[6].is_empty() {
+                            Some(parts[6].to_string())
+                        } else {
+                            None
+                        };
+                        let pane_dead = parts.get(7).map(|s| *s == "1").unwrap_or(false);
+                        Some(TmuxPane {
+                            pane_id,
+                            window_name,
+                            window_index,
+                            session_name: session_name_str,
+                            cwd,
+                            running_cmd,
+                            pane_title,
+                            pane_dead,
+                        })
+                    })
+                    .collect();
+
+                all_panes.extend(panes);
+            }
+
+            total_panes += all_panes.len();
             TmuxSession {
                 name: session_name.clone(),
                 group: group.clone(),
-                panes,
+                panes: all_panes,
             }
         })
         .collect();
@@ -718,17 +769,38 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
     let clock = now.format("%H:%M:%S").to_string();
     let countdown = format!("↻ in {}s", state.refresh_countdown);
 
-    // Count active panes
-    let active_count = state
-        .sessions
-        .iter()
-        .filter(|s| s.status == SessionStatus::InProgress)
-        .count();
-    let failed_count = state
-        .sessions
-        .iter()
-        .filter(|s| s.status == SessionStatus::Error)
-        .count();
+    // Count sessions by status
+    let in_progress = state.sessions.iter().filter(|s| s.status == SessionStatus::InProgress).count();
+    let pending = state.sessions.iter().filter(|s| s.status == SessionStatus::Pending).count();
+    let idle = state.sessions.iter().filter(|s| s.status == SessionStatus::Idle).count();
+    let done = state.sessions.iter().filter(|s| s.status == SessionStatus::Done).count();
+    let error = state.sessions.iter().filter(|s| s.status == SessionStatus::Error).count();
+
+    // Build status breakdown
+    let status_line = {
+        let mut parts = Vec::new();
+        if in_progress > 0 {
+            parts.push(Span::raw(format!("⚡{} ", in_progress)).set_style(Style::default().fg(colors::GREEN)));
+        }
+        if pending > 0 {
+            parts.push(Span::raw(format!("○{} ", pending)).set_style(Style::default().fg(colors::YELLOW)));
+        }
+        if idle > 0 {
+            parts.push(Span::raw(format!("·{} ", idle)).set_style(Style::default().fg(colors::SECONDARY)));
+        }
+        if done > 0 {
+            parts.push(Span::raw(format!("✓{} ", done)).set_style(Style::default().fg(colors::CYAN)));
+        }
+        if error > 0 {
+            parts.push(Span::raw(format!("✗{} ", error)).set_style(Style::default().fg(colors::RED)));
+        }
+        if parts.is_empty() {
+            parts.push(Span::raw("— ").set_style(Style::default().fg(colors::SECONDARY)));
+        }
+        parts
+    };
+
+    let token_str = format_tokens(state.aggregated_tokens.today_tokens);
 
     let line = Line::from(vec![
         Span::raw("  claude-watch  ")
@@ -736,18 +808,14 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
         Span::raw(&clock).set_style(Style::default().fg(colors::PRIMARY)),
         Span::raw("  ").set_style(Style::default()),
         Span::raw(&countdown).set_style(Style::default().fg(colors::SECONDARY)),
-        Span::raw("                                           ")
-            .set_style(Style::default().fg(colors::SURFACE)),
-        if failed_count > 0 {
-            Span::raw(format!("  ✗ {} failed", failed_count))
-                .set_style(Style::default().fg(colors::RED))
-        } else if active_count > 0 {
-            Span::raw(format!("  ⚡ {} active", active_count))
-                .set_style(Style::default().fg(colors::GREEN))
-        } else {
-            Span::raw("  ○ idle").set_style(Style::default().fg(colors::SECONDARY))
-        },
-    ]);
+        Span::raw("  ").set_style(Style::default()),
+        Span::raw(&token_str).set_style(Style::default().fg(colors::YELLOW)),
+        Span::raw(" today").set_style(Style::default().fg(colors::SECONDARY)),
+        Span::raw("     ").set_style(Style::default().fg(colors::SURFACE)),
+    ]
+    .into_iter()
+    .chain(status_line.into_iter())
+    .collect::<Vec<_>>());
 
     f.render_widget(
         Paragraph::new(line).set_style(Style::default().bg(colors::SURFACE)),
@@ -758,7 +826,7 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
 // Tree item for the tmux panel — each entry knows its depth and type
 enum TmuxTreeEntry {
     Session { name: String },
-    Window { session: String, name: String },
+    Window { session: String, name: String, index: String },
     Pane {
         pane_key: PaneKey,
         pane_label: String,    // tmux window name
@@ -832,27 +900,28 @@ fn render_tmux_panel(f: &mut Frame, area: Rect, state: &AppState) {
         });
 
         // Group panes by window (preserving order)
-        let mut panes_by_window: Vec<(String, Vec<&TmuxPane>)> = Vec::new();
+        let mut panes_by_window: Vec<(String, String, Vec<&TmuxPane>)> = Vec::new();
         let mut seen_windows: Vec<String> = Vec::new();
         for pane in &agent_panes {
             if !seen_windows.contains(&pane.window_name) {
                 seen_windows.push(pane.window_name.clone());
-                panes_by_window.push((pane.window_name.clone(), Vec::new()));
+                panes_by_window.push((pane.window_name.clone(), pane.window_index.clone(), Vec::new()));
             }
             let group = panes_by_window
                 .iter_mut()
-                .find(|(name, _)| name == &pane.window_name);
-            if let Some((_, panes)) = group {
+                .find(|(name, _, _)| name == &pane.window_name);
+            if let Some((_, _, panes)) = group {
                 panes.push(pane);
             }
         }
 
-        for (window_name, window_panes) in panes_by_window.into_iter() {
+        for (window_name, window_index, window_panes) in panes_by_window.into_iter() {
             // Only add window header if multiple windows exist
             if seen_windows.len() > 1 {
                 tree.push(TmuxTreeEntry::Window {
                     session: session.name.clone(),
                     name: window_name.clone(),
+                    index: window_index.clone(),
                 });
             }
 
@@ -970,7 +1039,7 @@ fn render_tmux_panel(f: &mut Frame, area: Rect, state: &AppState) {
                 ]));
             }
 
-            TmuxTreeEntry::Window { session, name } => {
+            TmuxTreeEntry::Window { session, name, index } => {
                 let is_ancestor_of_selected = selected_pane_key
                     .as_ref()
                     .map(|pk| pk.session == *session && pk.window == *name)
@@ -980,8 +1049,8 @@ fn render_tmux_panel(f: &mut Frame, area: Rect, state: &AppState) {
                 } else {
                     Style::default().fg(colors::SECONDARY)
                 };
-                // Improved tree branch: show proper nesting
-                let line = format!("  ├── {}", name);
+                // Improved tree branch: show proper nesting with window index
+                let line = format!("  ├──[{}] {}", index, name);
                 lines.push(Line::from(vec![Span::raw(line).set_style(style)]));
             }
 
@@ -1039,7 +1108,7 @@ fn render_tmux_panel(f: &mut Frame, area: Rect, state: &AppState) {
     }
 
     // Scrollbar
-    if total_lines > max_lines {
+    if total_lines > max_lines && inner.height >= 3 {
         let scroll_pct = selected_tree_idx.map(|i| i as f32 / (total_lines - 1) as f32).unwrap_or(0.0);
         let scroll_y = (scroll_pct * (inner.height - 2) as f32) as u16;
         f.render_widget(
@@ -1058,168 +1127,169 @@ fn render_tmux_panel(f: &mut Frame, area: Rect, state: &AppState) {
     f.render_widget(para, inner);
 }
 
-fn render_session_queue(f: &mut Frame, area: Rect, state: &AppState) {
+// ============================================================================
+// Tmux Pane Capture
+// ============================================================================
+
+/// Capture the visible content of a tmux pane using capture-pane
+fn capture_pane_content(socket: &Option<String>, session: &str, window_idx: &str, pane: &str) -> Vec<String> {
+    let socket_args: Vec<&str> = match socket {
+        Some(s) => ["-L", s.as_str()].to_vec(),
+        None => vec![],
+    };
+
+    // tmux capture-pane requires session:window.pane format
+    let target = format!("{}:{}.{}", session, window_idx, pane);
+
+    let output = {
+        let mut cmd = std::process::Command::new("tmux");
+        for arg in &socket_args {
+            cmd.arg(arg);
+        }
+        cmd.args(["capture-pane", "-t", &target, "-p", "-S", "-50"]);
+        cmd.output()
+    };
+
+    match output {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|s| s.to_string())
+                .collect()
+        }
+        _ => vec![],
+    }
+}
+
+// ============================================================================
+// Rendering - Live Pane Panel (Right Top)
+// ============================================================================
+
+fn render_live_pane(f: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::new()
-        .title(" session queue ")
+        .title(" live ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(colors::BORDER))
-        .title_style(Style::default().fg(colors::ACCENT).add_modifier(Modifier::BOLD))
+        .title_style(Style::default().fg(colors::GREEN).add_modifier(Modifier::BOLD))
         .style(Style::default().bg(colors::BG));
 
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // Map selected pane idx to a session
-    let session = if let Some(ref ws) = state.tmux_workspace {
-        // Only look at agent panes for the selected index
-        let all_agent_panes: Vec<PaneKey> = ws
+    // Get selected pane info
+    let (pane_key, pane_info): (PaneKey, Option<TmuxPane>) = if let Some(ref ws) = state.tmux_workspace {
+        let all_agent_panes: Vec<(PaneKey, TmuxPane)> = ws
             .sessions
             .iter()
             .flat_map(|s| {
                 s.panes
                     .iter()
                     .filter(|p| is_coding_agent(p))
-                    .map(|p| PaneKey {
-                        session: s.name.clone(),
-                        window: p.window_name.clone(),
-                        pane: p.pane_id.clone(),
+                    .map(|p| {
+                        let key = PaneKey {
+                            session: s.name.clone(),
+                            window: p.window_name.clone(),
+                            pane: p.pane_id.clone(),
+                        };
+                        (key, p.clone())
                     })
                     .collect::<Vec<_>>()
             })
             .collect();
 
         let selected = state.selected_pane_idx.min(all_agent_panes.len().saturating_sub(1));
-        let pane_key = all_agent_panes.get(selected).cloned();
-
-        pane_key.and_then(|pk| state.session_by_pane.get(&pk).and_then(|&i| state.sessions.get(i)).cloned())
+        all_agent_panes.into_iter().nth(selected)
+            .map(|(k, p)| (k, Some(p)))
+            .unwrap_or_else(|| (PaneKey { session: String::new(), window: String::new(), pane: String::new() }, None))
     } else {
-        state.sessions.first().cloned()
+        (PaneKey { session: String::new(), window: String::new(), pane: String::new() }, None)
     };
 
-    let Some(session) = session else {
-        let msg = Paragraph::new("  no session for selected pane")
-            .set_style(Style::default().fg(colors::SECONDARY));
-        f.render_widget(msg, inner);
-        return;
+    // Live poll indicator
+    let poll_str = if pane_info.is_some() {
+        let cd = state.refresh_countdown;
+        if cd > 3 { "⚡ polling".to_string() } else { format!("↻ {}s", cd) }
+    } else {
+        String::new()
     };
 
-    let status_icon = session_status_icon(session.status);
-    let status_color = session_status_color(session.status);
-    let branch_str = session
-        .git_branch
-        .as_ref()
-        .map(|b| format!("@{}", b))
-        .unwrap_or_default();
+    match pane_info {
+        Some(pane) => {
+            // Capture live pane content via tmux capture-pane
+            let lines = capture_pane_content(&state.tmux_socket, &pane_key.session, &pane.window_index, &pane_key.pane);
 
-    let idle_min = (Utc::now() - session.last_active).num_minutes();
-    let idle_str = if idle_min < 1 {
-        "just now".to_string()
-    } else {
-        format!("{}m ago", idle_min)
-    };
+            // Header with pane info
+            let pane_label = pane.running_cmd.as_deref().unwrap_or("—");
+            let status_color = if pane.pane_dead { colors::RED } else { colors::GREEN };
+            let status_str = if pane.pane_dead { "dead ✗" } else { "active ⚡" };
 
-    let mut lines: Vec<Line> = vec![
-        // Header row
-        Line::from(vec![
-            Span::raw(status_icon).set_style(Style::default().fg(status_color)),
-            Span::raw(" ").set_style(Style::default()),
-            Span::raw(&session.project)
-                .set_style(Style::default().fg(colors::ACCENT).add_modifier(Modifier::BOLD)),
-            Span::raw(" ").set_style(Style::default()),
-            Span::raw(&branch_str).set_style(Style::default().fg(colors::PURPLE)),
-            Span::raw(" · ").set_style(Style::default().fg(colors::SECONDARY)),
-            Span::raw(&session.cwd)
-                .set_style(Style::default().fg(colors::SECONDARY)),
-        ]),
-        Line::from(vec![
-            Span::raw("  session: ").set_style(Style::default().fg(colors::SECONDARY)),
-            Span::raw(&session.id).set_style(Style::default().fg(colors::CYAN)),
-            Span::raw(" · last active: ").set_style(Style::default().fg(colors::SECONDARY)),
-            Span::raw(idle_str).set_style(Style::default().fg(colors::YELLOW)),
-        ]),
-        Line::from(vec![]),
-        // Message counts
-        Line::from(vec![Span::raw(" msgs ")
-            .set_style(Style::default().fg(colors::SECONDARY).add_modifier(Modifier::BOLD))]),
-        Line::from(vec![
-            Span::raw("  ● asst: ").set_style(Style::default().fg(colors::SECONDARY)),
-            Span::raw(format!("{}", session.message_counts.assistant))
-                .set_style(Style::default().fg(colors::GREEN)),
-            Span::raw("  ● user: ").set_style(Style::default().fg(colors::SECONDARY)),
-            Span::raw(format!("{}", session.message_counts.user))
-                .set_style(Style::default().fg(colors::CYAN)),
-            Span::raw("  ● sys: ").set_style(Style::default().fg(colors::SECONDARY)),
-            Span::raw(format!("{}", session.message_counts.system))
-                .set_style(Style::default().fg(colors::PURPLE)),
-        ]),
-        Line::from(vec![]),
-        // Token counts
-        Line::from(vec![Span::raw(" tokens ")
-            .set_style(Style::default().fg(colors::SECONDARY).add_modifier(Modifier::BOLD))]),
-    ];
-
-    let total = session.token_counts.total();
-    if total > 0 {
-        let in_pct = (session.token_counts.input_tokens as f32 / total as f32 * 100.0) as u16;
-        lines.push(Line::from(vec![
-            Span::raw("  in:      ").set_style(Style::default().fg(colors::SECONDARY)),
-            Span::raw(format!("{}", session.token_counts.input_tokens))
-                .set_style(Style::default().fg(colors::CYAN)),
-            Span::raw(format!(" ({}%)", in_pct))
-                .set_style(Style::default().fg(colors::SECONDARY)),
-        ]));
-        lines.push(Line::from(vec![
-            Span::raw("  out:     ").set_style(Style::default().fg(colors::SECONDARY)),
-            Span::raw(format!("{}", session.token_counts.output_tokens))
-                .set_style(Style::default().fg(colors::YELLOW)),
-        ]));
-        let cache_total =
-            session.token_counts.cache_read_input_tokens + session.token_counts.cache_creation_input_tokens;
-        lines.push(Line::from(vec![
-            Span::raw("  cache:   ").set_style(Style::default().fg(colors::SECONDARY)),
-            Span::raw(format!("{}", cache_total))
-                .set_style(Style::default().fg(colors::PURPLE)),
-        ]));
-    } else {
-        lines.push(Line::from(vec![
-            Span::raw("  —").set_style(Style::default().fg(colors::SECONDARY)),
-        ]));
-    }
-
-    lines.push(Line::from(vec![]));
-    lines.push(Line::from(vec![Span::raw(" queue ")
-        .set_style(Style::default().fg(colors::SECONDARY).add_modifier(Modifier::BOLD))]));
-
-    if session.queue_ops.is_empty() {
-        lines.push(Line::from(vec![
-            Span::raw("  — no operations")
-                .set_style(Style::default().fg(colors::SECONDARY)),
-        ]));
-    } else {
-        for op in session.queue_ops.iter().rev().take(8) {
-            let icon = queue_op_icon(&op.operation);
-            let icon_color = queue_op_color(&op.operation);
-            let time_str = op.timestamp.format("%H:%M:%S").to_string();
-            lines.push(Line::from(vec![
+            let header = vec![
+                Span::raw(status_str).set_style(Style::default().fg(status_color)),
+                Span::raw(" ").set_style(Style::default()),
+                Span::raw(pane_label).set_style(Style::default().fg(colors::ACCENT).add_modifier(Modifier::BOLD)),
                 Span::raw("  ").set_style(Style::default()),
-                Span::raw(icon).set_style(Style::default().fg(icon_color)),
-                Span::raw(" [").set_style(Style::default().fg(colors::SECONDARY)),
-                Span::raw(time_str).set_style(Style::default().fg(colors::CYAN)),
-                Span::raw("] ").set_style(Style::default().fg(colors::SECONDARY)),
-                Span::raw(&op.operation)
-                    .set_style(Style::default().fg(colors::PRIMARY)),
-            ]));
+                Span::raw(&pane_key.session).set_style(Style::default().fg(colors::SECONDARY)),
+                Span::raw("/").set_style(Style::default().fg(colors::SECONDARY)),
+                Span::raw(&pane_key.window).set_style(Style::default().fg(colors::SECONDARY)),
+                Span::raw("/").set_style(Style::default().fg(colors::CYAN)),
+                Span::raw(&pane_key.pane).set_style(Style::default().fg(colors::CYAN)),
+                Span::raw("  ").set_style(Style::default()),
+                Span::raw(&poll_str).set_style(Style::default().fg(if pane.pane_dead { colors::SECONDARY } else { colors::GREEN })),
+            ];
+
+            let mut all_lines: Vec<Line> = vec![Line::from(header)];
+
+            if pane.pane_dead {
+                all_lines.push(Line::from(vec![Span::raw("  [pane is dead]").set_style(Style::default().fg(colors::RED))]));
+            } else if lines.is_empty() {
+                all_lines.push(Line::from(vec![Span::raw("  [pane content unavailable]").set_style(Style::default().fg(colors::SECONDARY))]));
+            } else {
+                // Show last N lines of pane content, truncated to fit width
+                let max_lines = (inner.height as usize).saturating_sub(3).max(1);
+                let max_chars = (inner.width as usize).saturating_sub(4).max(10);
+                for line_text in lines.iter().rev().take(max_lines).rev() {
+                    let display: String = if line_text.chars().count() > max_chars {
+                        let mut chars = 0;
+                        let end = line_text.char_indices()
+                            .take_while(|(_, _c)| {
+                                chars += 1;
+                                chars <= max_chars.saturating_sub(3)
+                            })
+                            .last()
+                            .map(|(i, _)| i + 1)
+                            .unwrap_or(0);
+                        format!("{}...", &line_text[..end])
+                    } else {
+                        line_text.clone()
+                    };
+                    all_lines.push(Line::from(vec![
+                        Span::raw("  ").set_style(Style::default().fg(colors::SECONDARY)),
+                        Span::raw(display).set_style(Style::default().fg(colors::PRIMARY)),
+                    ]));
+                }
+            }
+
+            let para = Paragraph::new(all_lines).set_style(Style::default().bg(colors::BG));
+            f.render_widget(para, inner);
+        }
+        None => {
+            let lines = vec![
+                Line::from(vec![Span::raw("  no pane selected").set_style(Style::default().fg(colors::SECONDARY))]),
+                Line::from(vec![Span::raw("  use j/k to navigate").set_style(Style::default().fg(colors::SECONDARY))]),
+            ];
+            let para = Paragraph::new(lines).set_style(Style::default().bg(colors::BG));
+            f.render_widget(para, inner);
         }
     }
-
-    let para = Paragraph::new(lines)
-        .set_style(Style::default().bg(colors::BG));
-    f.render_widget(para, inner);
 }
 
-fn render_token_usage(f: &mut Frame, area: Rect, state: &AppState) {
+// ============================================================================
+// Rendering - Session Metadata Panel (Right Bottom)
+// ============================================================================
+
+fn render_session_metadata(f: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::new()
-        .title(" tokens ")
+        .title(" session ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(colors::BORDER))
         .title_style(Style::default().fg(colors::YELLOW).add_modifier(Modifier::BOLD))
@@ -1228,103 +1298,175 @@ fn render_token_usage(f: &mut Frame, area: Rect, state: &AppState) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let agg = &state.aggregated_tokens;
-    let daily_limit = 1_500_000u64;
-    let gauge_pct = ((agg.today_tokens as f64 / daily_limit as f64) * 100.0).min(100.0) as u16;
+    // Get selected pane info and corresponding session
+    let (pane_key, pane_info): (PaneKey, Option<TmuxPane>) = if let Some(ref ws) = state.tmux_workspace {
+        let all_agent_panes: Vec<(PaneKey, TmuxPane)> = ws
+            .sessions
+            .iter()
+            .flat_map(|s| {
+                s.panes
+                    .iter()
+                    .filter(|p| is_coding_agent(p))
+                    .map(|p| {
+                        let key = PaneKey {
+                            session: s.name.clone(),
+                            window: p.window_name.clone(),
+                            pane: p.pane_id.clone(),
+                        };
+                        (key, p.clone())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
 
-    let gauge_color = if gauge_pct >= 90 {
-        colors::RED
-    } else if gauge_pct >= 75 {
-        colors::YELLOW
+        let selected = state.selected_pane_idx.min(all_agent_panes.len().saturating_sub(1));
+        all_agent_panes.into_iter().nth(selected)
+            .map(|(k, p)| (k, Some(p)))
+            .unwrap_or_else(|| (PaneKey { session: String::new(), window: String::new(), pane: String::new() }, None))
     } else {
-        colors::CYAN
+        (PaneKey { session: String::new(), window: String::new(), pane: String::new() }, None)
     };
 
-    let gauge = Gauge::default()
-        .gauge_style(Style::default().fg(gauge_color).bg(colors::SURFACE))
-        .percent(gauge_pct)
-        .label(format!("{}/1.5M", format_tokens(agg.today_tokens)));
+    let session = state.session_by_pane.get(&pane_key).and_then(|&i| state.sessions.get(i));
 
-    f.render_widget(
-        gauge,
-        Rect::new(inner.x + 1, inner.y + 1, inner.width.saturating_sub(2), 3),
-    );
+    match session {
+        Some(session) => {
+            let status_icon = session_status_icon(session.status);
+            let status_color = session_status_color(session.status);
+            let branch_str = session.git_branch.as_ref().map(|b| format!("@{}", b)).unwrap_or_default();
+            let idle_min = (Utc::now() - session.last_active).num_minutes();
+            let idle_str = if idle_min < 1 { "just now".to_string() } else { format!("{}m ago", idle_min) };
 
-    let mut info_lines: Vec<Line> = vec![
-        Line::from(vec![
-            Span::raw(format!("  ${:.4}", agg.today_cost))
-                .set_style(Style::default().fg(colors::YELLOW).add_modifier(Modifier::BOLD)),
-            Span::raw(" today cost")
-                .set_style(Style::default().fg(colors::SECONDARY)),
-        ]),
-        Line::from(vec![
-            Span::raw("  today: ").set_style(Style::default().fg(colors::SECONDARY)),
-            Span::raw(format_tokens(agg.today_tokens))
-                .set_style(Style::default().fg(colors::PRIMARY)),
-            Span::raw(" tokens").set_style(Style::default().fg(colors::SECONDARY)),
-        ]),
-        Line::from(vec![
-            Span::raw("  all-time: ").set_style(Style::default().fg(colors::SECONDARY)),
-            Span::raw(format!("${:.4}", agg.total_cost))
-                .set_style(Style::default().fg(colors::YELLOW)),
-            Span::raw(" / ")
-                .set_style(Style::default().fg(colors::SECONDARY)),
-            Span::raw(format_tokens(agg.total_tokens))
-                .set_style(Style::default().fg(colors::PRIMARY)),
-            Span::raw(" tokens").set_style(Style::default().fg(colors::SECONDARY)),
-        ]),
-    ];
+            let mut lines: Vec<Line> = vec![
+                Line::from(vec![
+                    Span::raw(status_icon).set_style(Style::default().fg(status_color)),
+                    Span::raw(" ").set_style(Style::default()),
+                    Span::raw(&session.project).set_style(Style::default().fg(colors::ACCENT).add_modifier(Modifier::BOLD)),
+                    Span::raw(" ").set_style(Style::default()),
+                    Span::raw(&branch_str).set_style(Style::default().fg(colors::PURPLE)),
+                ]),
+                Line::from(vec![
+                    Span::raw("  id: ").set_style(Style::default().fg(colors::SECONDARY)),
+                    Span::raw(&session.id).set_style(Style::default().fg(colors::CYAN)),
+                    Span::raw(" · last: ").set_style(Style::default().fg(colors::SECONDARY)),
+                    Span::raw(&idle_str).set_style(Style::default().fg(colors::YELLOW)),
+                ]),
+            ];
 
-    // Last hour rate
-    if let Some(last_rate) = agg.hourly_rates.last().copied() {
-        info_lines.push(Line::from(vec![
-            Span::raw("  last hr: ").set_style(Style::default().fg(colors::SECONDARY)),
-            Span::raw(format_tokens(last_rate))
-                .set_style(Style::default().fg(colors::CYAN)),
-            Span::raw(" tokens").set_style(Style::default().fg(colors::SECONDARY)),
-        ]));
+            // Truncate cwd
+            let cwd_display = if session.cwd.chars().count() > 35 {
+                format!("...{}", truncate_from_end(&session.cwd, 32))
+            } else {
+                session.cwd.clone()
+            };
+            lines.push(Line::from(vec![
+                Span::raw("  cwd: ").set_style(Style::default().fg(colors::SECONDARY)),
+                Span::raw(&cwd_display).set_style(Style::default().fg(colors::PRIMARY)),
+            ]));
+
+            lines.push(Line::from(vec![]));
+            lines.push(Line::from(vec![Span::raw(" msgs ").set_style(Style::default().fg(colors::SECONDARY).add_modifier(Modifier::BOLD))]));
+            lines.push(Line::from(vec![
+                Span::raw("  ● asst: ").set_style(Style::default().fg(colors::SECONDARY)),
+                Span::raw(format!("{}", session.message_counts.assistant)).set_style(Style::default().fg(colors::GREEN)),
+                Span::raw("  ● user: ").set_style(Style::default().fg(colors::SECONDARY)),
+                Span::raw(format!("{}", session.message_counts.user)).set_style(Style::default().fg(colors::CYAN)),
+                Span::raw("  ● sys: ").set_style(Style::default().fg(colors::SECONDARY)),
+                Span::raw(format!("{}", session.message_counts.system)).set_style(Style::default().fg(colors::PURPLE)),
+            ]));
+
+            lines.push(Line::from(vec![]));
+            lines.push(Line::from(vec![Span::raw(" tokens ").set_style(Style::default().fg(colors::SECONDARY).add_modifier(Modifier::BOLD))]));
+
+            let total = session.token_counts.total();
+            if total > 0 {
+                // Draw token breakdown bar
+                let bar_width = (inner.width.saturating_sub(4) as u64).max(1);
+                let draw_bar = |tokens: u64, color: Color, label: &str| {
+                    let bar_len = ((tokens as f64 / total as f64) * bar_width as f64) as u16;
+                    let bar_str = "█".repeat(bar_len as usize);
+                    vec![
+                        Span::raw(format!("{:>6} ", format_tokens(tokens))).set_style(Style::default().fg(colors::SECONDARY)),
+                        Span::raw(bar_str).set_style(Style::default().fg(color)),
+                        Span::raw(format!(" {:>4.0}% {}", (tokens as f64 / total as f64 * 100.0), label)).set_style(Style::default().fg(colors::SECONDARY)),
+                    ]
+                };
+                lines.push(Line::from(draw_bar(session.token_counts.input_tokens, colors::CYAN, "in")));
+                lines.push(Line::from(draw_bar(session.token_counts.output_tokens, colors::YELLOW, "out")));
+                let cache_total = session.token_counts.cache_read_input_tokens + session.token_counts.cache_creation_input_tokens;
+                lines.push(Line::from(draw_bar(cache_total, colors::PURPLE, "cache")));
+            } else {
+                lines.push(Line::from(vec![Span::raw("  — no token data").set_style(Style::default().fg(colors::SECONDARY))]));
+            }
+
+            lines.push(Line::from(vec![]));
+            lines.push(Line::from(vec![Span::raw(" queue ").set_style(Style::default().fg(colors::SECONDARY).add_modifier(Modifier::BOLD))]));
+
+            if session.queue_ops.is_empty() {
+                let idle_m = (Utc::now() - session.last_active).num_minutes();
+                if idle_m > 60 {
+                    lines.push(Line::from(vec![Span::raw("  — idle >1h, no queue ops").set_style(Style::default().fg(colors::SECONDARY))]));
+                } else if session.message_counts.assistant == 0 && session.message_counts.user == 0 {
+                    lines.push(Line::from(vec![Span::raw("  — new session, no ops yet").set_style(Style::default().fg(colors::SECONDARY))]));
+                } else {
+                    lines.push(Line::from(vec![Span::raw("  — no operations").set_style(Style::default().fg(colors::SECONDARY))]));
+                }
+            } else {
+                for op in session.queue_ops.iter().rev().take(6) {
+                    let icon = queue_op_icon(&op.operation);
+                    let icon_color = queue_op_color(&op.operation);
+                    let time_str = op.timestamp.format("%H:%M:%S").to_string();
+                    lines.push(Line::from(vec![
+                        Span::raw("  ").set_style(Style::default()),
+                        Span::raw(icon).set_style(Style::default().fg(icon_color)),
+                        Span::raw(" [").set_style(Style::default().fg(colors::SECONDARY)),
+                        Span::raw(time_str).set_style(Style::default().fg(colors::CYAN)),
+                        Span::raw("] ").set_style(Style::default().fg(colors::SECONDARY)),
+                        Span::raw(&op.operation).set_style(Style::default().fg(colors::PRIMARY)),
+                    ]));
+                }
+            }
+
+            let remaining = inner.height.saturating_sub(lines.len() as u16);
+            if remaining > 1 {
+                for _ in 0..(remaining - 1) as usize {
+                    lines.push(Line::from(vec![]));
+                }
+            }
+
+            let para = Paragraph::new(lines).set_style(Style::default().bg(colors::BG));
+            f.render_widget(para, inner);
+        }
+        None => {
+            // No JSONL session matched — show pane metadata
+            let mut lines = vec![
+                Line::from(vec![Span::raw("  no JSONL session matched").set_style(Style::default().fg(colors::YELLOW))]),
+            ];
+            if let Some(ref pane) = pane_info {
+                lines.push(Line::from(vec![
+                    Span::raw("  cwd: ").set_style(Style::default().fg(colors::SECONDARY)),
+                    {
+                        let cwd = if pane.cwd.len() > 35 {
+                            format!("...{}", truncate_from_end(&pane.cwd, 32))
+                        } else {
+                            pane.cwd.clone()
+                        };
+                        Span::raw(cwd).set_style(Style::default().fg(colors::PRIMARY))
+                    },
+                ]));
+                lines.push(Line::from(vec![
+                    Span::raw("  cmd: ").set_style(Style::default().fg(colors::SECONDARY)),
+                    Span::raw(pane.running_cmd.as_deref().unwrap_or("—")).set_style(Style::default().fg(colors::GREEN)),
+                ]));
+            }
+            lines.push(Line::from(vec![]));
+            lines.push(Line::from(vec![Span::raw("  token/queue data requires JSONL").set_style(Style::default().fg(colors::SECONDARY))]));
+            lines.push(Line::from(vec![Span::raw("  match (cwd or project name)").set_style(Style::default().fg(colors::SECONDARY))]));
+
+            let para = Paragraph::new(lines).set_style(Style::default().bg(colors::BG));
+            f.render_widget(para, inner);
+        }
     }
-
-    info_lines.push(Line::from(vec![]));
-
-    // Model breakdown
-    let mut model_tokens: HashMap<String, u64> = HashMap::new();
-    for entry in &agg.entries_today {
-        *model_tokens.entry(entry.model.clone()).or_insert(0) += entry.total_tokens;
-    }
-    let mut model_vec: Vec<(String, u64)> = model_tokens.into_iter().collect();
-    model_vec.sort_by(|a, b| b.1.cmp(&a.1));
-
-    info_lines.push(Line::from(vec![Span::raw("  by model")
-        .set_style(Style::default().fg(colors::SECONDARY).add_modifier(Modifier::BOLD))]));
-    for (model, tokens) in model_vec.iter().take(4) {
-        let pct = if agg.today_tokens > 0 {
-            tokens * 100 / agg.today_tokens
-        } else {
-            0
-        };
-        info_lines.push(Line::from(vec![
-            Span::raw("  · ").set_style(Style::default().fg(colors::SECONDARY)),
-            Span::raw(format!("{:>6}", format_tokens(*tokens)))
-                .set_style(Style::default().fg(colors::ACCENT)),
-            Span::raw(format!(" ({:>3}%) ", pct))
-                .set_style(Style::default().fg(colors::SECONDARY)),
-            Span::raw(model).set_style(Style::default().fg(colors::PRIMARY)),
-        ]));
-    }
-
-    let remaining = inner.height.saturating_sub(5);
-    let final_lines: Vec<Line> = info_lines.into_iter().take(remaining as usize).collect();
-
-    f.render_widget(
-        Paragraph::new(final_lines).set_style(Style::default().bg(colors::BG)),
-        Rect::new(
-            inner.x + 1,
-            inner.y + 5,
-            inner.width.saturating_sub(2),
-            remaining,
-        ),
-    );
 }
 
 fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState) {
@@ -1335,8 +1477,14 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState) {
     f.render_widget(block, area);
 
     let pane_count = state.agent_pane_count;
-    let session_count = state.sessions.len();
     let token_str = format_tokens(state.aggregated_tokens.total_tokens);
+
+    // Count sessions by status
+    let in_progress = state.sessions.iter().filter(|s| s.status == SessionStatus::InProgress).count();
+    let pending = state.sessions.iter().filter(|s| s.status == SessionStatus::Pending).count();
+    let idle = state.sessions.iter().filter(|s| s.status == SessionStatus::Idle).count();
+    let done = state.sessions.iter().filter(|s| s.status == SessionStatus::Done).count();
+    let error = state.sessions.iter().filter(|s| s.status == SessionStatus::Error).count();
 
     let left = vec![
         Span::raw("q:quit").set_style(Style::default().fg(colors::SECONDARY)),
@@ -1350,12 +1498,23 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState) {
             .set_style(Style::default().fg(colors::SECONDARY)),
     ];
 
+    // Build status breakdown string
+    let status_parts = {
+        let mut parts = Vec::new();
+        if in_progress > 0 { parts.push(format!("⚡{}", in_progress)); }
+        if pending > 0 { parts.push(format!("○{}", pending)); }
+        if idle > 0 { parts.push(format!("·{}", idle)); }
+        if done > 0 { parts.push(format!("✓{}", done)); }
+        if error > 0 { parts.push(format!("✗{}", error)); }
+        if parts.is_empty() { parts.push("—".to_string()); }
+        parts.join(" ")
+    };
+
     let right = vec![
-        Span::raw(format!("{} panes", pane_count))
+        Span::raw(format!("{} agent panes", pane_count))
             .set_style(Style::default().fg(colors::CYAN)),
         Span::raw(" · ").set_style(Style::default().fg(colors::SECONDARY)),
-        Span::raw(format!("{} sessions", session_count))
-            .set_style(Style::default().fg(colors::PRIMARY)),
+        Span::raw(&status_parts).set_style(Style::default().fg(colors::PRIMARY)),
         Span::raw(" · ").set_style(Style::default().fg(colors::SECONDARY)),
         Span::raw(&token_str)
             .set_style(Style::default().fg(colors::YELLOW)),
@@ -1408,7 +1567,7 @@ fn render(f: &mut Frame, area: Rect, state: &AppState) {
     // Left: TMUX panel (full height)
     render_tmux_panel(f, chunks[0], state);
 
-    // Right: session queue (top 60%) + tokens (bottom 40%)
+    // Right: live pane (top 60%) + session metadata (bottom 40%)
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1417,8 +1576,8 @@ fn render(f: &mut Frame, area: Rect, state: &AppState) {
         ])
         .split(chunks[1]);
 
-    render_session_queue(f, right_chunks[0], state);
-    render_token_usage(f, right_chunks[1], state);
+    render_live_pane(f, right_chunks[0], state);
+    render_session_metadata(f, right_chunks[1], state);
 
     // Status bar (1 line)
     render_status_bar(
@@ -1450,6 +1609,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         session_by_pane: HashMap::new(),
         aggregated_tokens: AggregatedTokens::default(),
         refresh_countdown: args.refresh_interval,
+        tmux_socket: args.tmux_socket.clone(),
     }));
 
     let args_clone = args.clone();
