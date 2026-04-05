@@ -1,10 +1,10 @@
 [package]
-name = "claude-watch"
+name = "claudeboard"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "A TUI for watching Claude Code sessions"
-repository = "https://github.com/tuannvm/claude-watch"
+repository = "https://github.com/tuannvm/claudeboard"
 
 [dependencies]
 ratatui = "0.26"
