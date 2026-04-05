@@ -415,8 +415,15 @@ impl LiteLLMPricing {
 }
 
 /// Compute cost for given token counts and model
-pub fn compute_cost(model: &str, input_tokens: u64, output_tokens: u64, cache_read: u64, cache_write: u64) -> f64 {
-    static PRICING: std::sync::LazyLock<LiteLLMPricing> = std::sync::LazyLock::new(LiteLLMPricing::load);
+pub fn compute_cost(
+    model: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read: u64,
+    cache_write: u64,
+) -> f64 {
+    static PRICING: std::sync::LazyLock<LiteLLMPricing> =
+        std::sync::LazyLock::new(LiteLLMPricing::load);
     let p = PRICING.get(model);
     (input_tokens as f64 * p.input_cost_per_token)
         + (output_tokens as f64 * p.output_cost_per_token)
@@ -739,7 +746,11 @@ fn process_jsonl_file(path: &Path) -> Vec<UsageRecord> {
     let rel_path = rel_path_raw.trim_start_matches('/');
     let parts: Vec<&str> = rel_path.split('/').collect();
 
-    let provider = if parts.first().map(|s| s.starts_with(".claude-")).unwrap_or(false) {
+    let provider = if parts
+        .first()
+        .map(|s| s.starts_with(".claude-"))
+        .unwrap_or(false)
+    {
         parts.first().unwrap_or(&".claude").to_string()
     } else {
         ".claude".to_string()
@@ -778,11 +789,7 @@ fn process_jsonl_file(path: &Path) -> Vec<UsageRecord> {
 
                 if let Some(ref message) = msg.message {
                     if let Some(ref usage) = message.usage {
-                        let model = message
-                            .model
-                            .as_deref()
-                            .unwrap_or("unknown")
-                            .to_string();
+                        let model = message.model.as_deref().unwrap_or("unknown").to_string();
 
                         let input = usage.input_tokens.unwrap_or(0);
                         let output = usage.output_tokens.unwrap_or(0);
@@ -872,7 +879,7 @@ fn scan_all_usage() -> AggregatedTokens {
         result.total_cache_read += record.cache_read_tokens;
         result.total_cache_write += record.cache_write_tokens;
 
-        // Parse timestamp for daily grouping (use UTC to handle timezone offsets correctly)
+        // Parse timestamp once for daily and hourly grouping
         if let Ok(ts) = DateTime::parse_from_rfc3339(&record.date) {
             let utc_date = ts.with_timezone(&Utc).date_naive();
             if utc_date == today {
@@ -883,10 +890,7 @@ fn scan_all_usage() -> AggregatedTokens {
                 result.today_cache_read += record.cache_read_tokens;
                 result.today_cache_write += record.cache_write_tokens;
             }
-        }
-
-        // Hourly rate (for charts if needed)
-        if let Ok(ts) = DateTime::parse_from_rfc3339(&record.date) {
+            // Hourly rate (for charts if needed)
             let hour_key = ts.timestamp() / 3600;
             *hourly_tokens.entry(hour_key).or_insert(0) += record.total_tokens;
         }
@@ -896,7 +900,9 @@ fn scan_all_usage() -> AggregatedTokens {
     let now_hour = Utc::now().timestamp() / 3600;
     for i in 0..24 {
         let hour = now_hour - i;
-        result.hourly_rates.push(hourly_tokens.get(&hour).copied().unwrap_or(0));
+        result
+            .hourly_rates
+            .push(hourly_tokens.get(&hour).copied().unwrap_or(0));
     }
     result.hourly_rates.reverse();
 
@@ -1217,54 +1223,38 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
             Span::raw(format_tokens(state.aggregated_tokens.today_input))
                 .set_style(Style::default().fg(colors::YELLOW)),
         );
-        header_spans.push(
-            Span::raw(" in, ").set_style(Style::default().fg(colors::SECONDARY)),
-        );
+        header_spans.push(Span::raw(" in, ").set_style(Style::default().fg(colors::SECONDARY)));
         header_spans.push(
             Span::raw(format_tokens(state.aggregated_tokens.today_output))
                 .set_style(Style::default().fg(colors::YELLOW)),
         );
-        header_spans.push(
-            Span::raw(" out, ").set_style(Style::default().fg(colors::SECONDARY)),
-        );
+        header_spans.push(Span::raw(" out, ").set_style(Style::default().fg(colors::SECONDARY)));
         if state.aggregated_tokens.today_cache_read > 0 {
             header_spans.push(
                 Span::raw(format_tokens(state.aggregated_tokens.today_cache_read))
                     .set_style(Style::default().fg(colors::PURPLE)),
             );
-            header_spans.push(
-                Span::raw(" cache, ").set_style(Style::default().fg(colors::SECONDARY)),
-            );
+            header_spans
+                .push(Span::raw(" cache, ").set_style(Style::default().fg(colors::SECONDARY)));
         }
         if state.aggregated_tokens.today_cache_write > 0 {
             header_spans.push(
                 Span::raw(format_tokens(state.aggregated_tokens.today_cache_write))
                     .set_style(Style::default().fg(colors::CYAN)),
             );
-            header_spans.push(
-                Span::raw(" cw, ").set_style(Style::default().fg(colors::SECONDARY)),
-            );
+            header_spans.push(Span::raw(" cw, ").set_style(Style::default().fg(colors::SECONDARY)));
         }
         if !cost_str.is_empty() {
-            header_spans.push(
-                Span::raw(cost_str.clone()).set_style(Style::default().fg(colors::GREEN)),
-            );
+            header_spans
+                .push(Span::raw(cost_str.clone()).set_style(Style::default().fg(colors::GREEN)));
         }
     } else {
         // Fallback to simple token count
-        header_spans.push(
-            Span::raw(&token_str).set_style(Style::default().fg(colors::YELLOW)),
-        );
-        header_spans.push(
-            Span::raw(" tokens").set_style(Style::default().fg(colors::SECONDARY)),
-        );
+        header_spans.push(Span::raw(&token_str).set_style(Style::default().fg(colors::YELLOW)));
+        header_spans.push(Span::raw(" tokens").set_style(Style::default().fg(colors::SECONDARY)));
         if !cost_str.is_empty() {
-            header_spans.push(
-                Span::raw("  ").set_style(Style::default()),
-            );
-            header_spans.push(
-                Span::raw(&cost_str).set_style(Style::default().fg(colors::GREEN)),
-            );
+            header_spans.push(Span::raw("  ").set_style(Style::default()));
+            header_spans.push(Span::raw(&cost_str).set_style(Style::default().fg(colors::GREEN)));
         }
     }
     header_spans.push(Span::raw("     ").set_style(Style::default().fg(colors::SURFACE)));
@@ -1807,14 +1797,8 @@ fn render_live_pane(f: &mut Frame, area: Rect, state: &AppState) {
                 for line_text in lines.iter().rev().take(max_lines).rev() {
                     let display = if line_text.chars().count() > max_chars {
                         let limit = max_chars.saturating_sub(3);
-                        let mut end_byte = line_text.len();
-                        for (char_count, (byte_idx, _)) in line_text.char_indices().enumerate() {
-                            if char_count >= limit {
-                                end_byte = byte_idx;
-                                break;
-                            }
-                        }
-                        format!("{}...", &line_text[..end_byte])
+                        let truncated: String = line_text.chars().take(limit).collect();
+                        format!("{}...", truncated)
                     } else {
                         line_text.clone()
                     };
@@ -2226,8 +2210,7 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState) {
     let total_cw = format_tokens(state.aggregated_tokens.total_cache_write);
 
     let mut right: Vec<Span<'_>> = vec![
-        Span::raw(format!("{} panes", pane_count))
-            .set_style(Style::default().fg(colors::CYAN)),
+        Span::raw(format!("{} panes", pane_count)).set_style(Style::default().fg(colors::CYAN)),
         Span::raw(" · ").set_style(Style::default().fg(colors::SECONDARY)),
         Span::raw(status_parts.clone()).set_style(Style::default().fg(colors::PRIMARY)),
         Span::raw(" · today: ").set_style(Style::default().fg(colors::SECONDARY)),
@@ -2266,9 +2249,8 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState) {
 
     let mut line_spans: Vec<Span<'_>> = Vec::new();
     line_spans.extend(left.iter().cloned());
-    line_spans.push(
-        Span::raw("                    ").set_style(Style::default().fg(colors::SURFACE)),
-    );
+    line_spans
+        .push(Span::raw("                    ").set_style(Style::default().fg(colors::SURFACE)));
     line_spans.extend(right);
 
     let line = Line::from(line_spans);
