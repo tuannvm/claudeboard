@@ -142,10 +142,21 @@ pub struct TokenUsageEntry {
 
 #[derive(Debug, Clone, Default)]
 pub struct AggregatedTokens {
+    // Total (all-time) breakdown
     pub total_tokens: u64,
     pub total_cost: f64,
+    pub total_input: u64,
+    pub total_output: u64,
+    pub total_cache_read: u64,
+    pub total_cache_write: u64,
+    // Today's breakdown
     pub today_tokens: u64,
     pub today_cost: f64,
+    pub today_input: u64,
+    pub today_output: u64,
+    pub today_cache_read: u64,
+    pub today_cache_write: u64,
+    // Entries for model breakdown display
     pub entries_today: Vec<TokenUsageEntry>,
     pub hourly_rates: Vec<u64>,
 }
@@ -233,12 +244,184 @@ pub struct AppState {
     // Session data (filtered to ≤7 days)
     pub sessions: Vec<Session>,
     pub session_by_pane: HashMap<PaneKey, usize>, // pane key -> session index
-    // Token data
+    // Token data (from JSONL, computed via LiteLLM pricing)
     pub aggregated_tokens: AggregatedTokens,
     // Refresh
     pub refresh_countdown: u64,
     // tmux socket (needed for live pane capture)
     pub tmux_socket: Option<String>,
+}
+
+// ============================================================================
+// LiteLLM Pricing
+// ============================================================================
+
+/// Pricing data for a single model from LiteLLM
+#[derive(Debug, Clone, Default)]
+pub struct ModelPricing {
+    pub input_cost_per_token: f64,
+    pub output_cost_per_token: f64,
+    pub cache_read_input_token_cost: f64,
+    pub cache_creation_input_token_cost: f64,
+}
+
+/// Fetched and cached LiteLLM pricing data
+#[derive(Debug, Clone, Default)]
+pub struct LiteLLMPricing {
+    pub models: HashMap<String, ModelPricing>,
+}
+
+/// Fallback hardcoded rates for models not in LiteLLM (matching token-usage skill)
+fn get_fallback_rates(model: &str) -> ModelPricing {
+    if model.contains("claude-opus-4") {
+        ModelPricing {
+            input_cost_per_token: 0.000015,
+            output_cost_per_token: 0.000075,
+            cache_read_input_token_cost: 0.0000015,
+            cache_creation_input_token_cost: 0.000015,
+        }
+    } else if model.contains("claude-sonnet-4") {
+        ModelPricing {
+            input_cost_per_token: 0.000003,
+            output_cost_per_token: 0.000015,
+            cache_read_input_token_cost: 0.0000003,
+            cache_creation_input_token_cost: 0.000003,
+        }
+    } else if model.contains("claude-haiku-4") {
+        ModelPricing {
+            input_cost_per_token: 0.0000008,
+            output_cost_per_token: 0.000004,
+            cache_read_input_token_cost: 0.0000001,
+            cache_creation_input_token_cost: 0.0000008,
+        }
+    } else if model.contains("glm-4") {
+        ModelPricing {
+            input_cost_per_token: 0.0000001,
+            output_cost_per_token: 0.0000005,
+            cache_read_input_token_cost: 0.0,
+            cache_creation_input_token_cost: 0.0,
+        }
+    } else if model.contains("gemini-2.5-") {
+        ModelPricing {
+            input_cost_per_token: 0.000000075,
+            output_cost_per_token: 0.00015,
+            cache_read_input_token_cost: 0.0,
+            cache_creation_input_token_cost: 0.0,
+        }
+    } else if model.contains("minimax") {
+        ModelPricing {
+            input_cost_per_token: 0.0,
+            output_cost_per_token: 0.0,
+            cache_read_input_token_cost: 0.0,
+            cache_creation_input_token_cost: 0.0,
+        }
+    } else {
+        ModelPricing::default()
+    }
+}
+
+impl LiteLLMPricing {
+    /// Load pricing from cache file, fetching if stale
+    pub fn load() -> Self {
+        let cache_dir = PathBuf::from(std::env::var("HOME").unwrap_or_default())
+            .join(".cache")
+            .join("claude-pricing");
+        let cache_file = cache_dir.join("litellm-pricing.json");
+        let cache_ttl = 86400; // 24 hours
+
+        // Check if cache exists and is fresh
+        let need_fetch = if !cache_file.exists() {
+            true
+        } else if let Ok(metadata) = std::fs::metadata(&cache_file) {
+            if let Ok(modified) = metadata.modified() {
+                let age = std::time::SystemTime::now()
+                    .duration_since(modified)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(cache_ttl + 1);
+                age > cache_ttl
+            } else {
+                true
+            }
+        } else {
+            true
+        };
+
+        // Fetch if needed
+        if need_fetch {
+            let _ = std::fs::create_dir_all(&cache_dir);
+            let url = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
+            // Use reqwest for native HTTP (no curl dependency)
+            if let Ok(client) = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+            {
+                if let Ok(response) = client.get(url).send() {
+                    if response.status().is_success() {
+                        let _ = std::fs::write(&cache_file, response.bytes().unwrap_or_default());
+                    }
+                }
+            }
+        }
+
+        // Parse cache file
+        let mut pricing = LiteLLMPricing::default();
+        if let Ok(content) = std::fs::read_to_string(&cache_file) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(obj) = json.as_object() {
+                    for (model_name, model_data) in obj {
+                        if let Some(data) = model_data.as_object() {
+                            let p = ModelPricing {
+                                input_cost_per_token: data
+                                    .get("input_cost_per_token")
+                                    .and_then(|v| v.as_f64())
+                                    .unwrap_or(0.0),
+                                output_cost_per_token: data
+                                    .get("output_cost_per_token")
+                                    .and_then(|v| v.as_f64())
+                                    .unwrap_or(0.0),
+                                cache_read_input_token_cost: data
+                                    .get("cache_read_input_token_cost")
+                                    .and_then(|v| v.as_f64())
+                                    .unwrap_or(0.0),
+                                cache_creation_input_token_cost: data
+                                    .get("cache_creation_input_token_cost")
+                                    .and_then(|v| v.as_f64())
+                                    .unwrap_or(0.0),
+                            };
+                            pricing.models.insert(model_name.clone(), p);
+                        }
+                    }
+                }
+            }
+        }
+
+        pricing
+    }
+
+    /// Get pricing for a model, with fallback to hardcoded rates
+    pub fn get(&self, model: &str) -> ModelPricing {
+        self.models.get(model).cloned().unwrap_or_else(|| {
+            // Try suffix match first (case-insensitive, like token-usage skill)
+            let model_lower = model.to_lowercase();
+            for (key, p) in &self.models {
+                let key_lower = key.to_lowercase();
+                if key_lower.ends_with(&format!("/{}", model_lower)) || key_lower == model_lower {
+                    return p.clone();
+                }
+            }
+            get_fallback_rates(model)
+        })
+    }
+}
+
+/// Compute cost for given token counts and model
+pub fn compute_cost(model: &str, input_tokens: u64, output_tokens: u64, cache_read: u64, cache_write: u64) -> f64 {
+    static PRICING: std::sync::LazyLock<LiteLLMPricing> = std::sync::LazyLock::new(LiteLLMPricing::load);
+    let p = PRICING.get(model);
+    (input_tokens as f64 * p.input_cost_per_token)
+        + (output_tokens as f64 * p.output_cost_per_token)
+        + (cache_read as f64 * p.cache_read_input_token_cost)
+        + (cache_write as f64 * p.cache_creation_input_token_cost)
 }
 
 // ============================================================================
@@ -255,11 +438,15 @@ struct JsonlMessage {
     #[serde(rename = "gitBranch")]
     git_branch: Option<String>,
     timestamp: Option<String>,
+    #[serde(rename = "uuid")]
+    uuid: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct MessageContent {
     usage: Option<Usage>,
+    #[serde(rename = "model")]
+    model: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -458,96 +645,262 @@ fn parse_session_jsonl(path: &Path, project: &str, project_path: &Path) -> Optio
 }
 
 // ============================================================================
-// Token Log Parsing
+// JSONL Usage Parsing (replaces token log parsing for cost)
 // ============================================================================
 
-fn parse_token_logs() -> AggregatedTokens {
-    let mut aggregated = AggregatedTokens::default();
-    let logs_dir = PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join(".claude")
-        .join("logs");
+/// A single aggregated usage record per session+model
+#[derive(Debug, Clone, Default)]
+struct UsageRecord {
+    pub session_id: String,
+    pub date: String,
+    pub provider: String,
+    pub project: String,
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub total_tokens: u64,
+    pub message_count: u64,
+}
 
-    if !logs_dir.exists() {
-        return aggregated;
+impl UsageRecord {
+    pub fn cost(&self) -> f64 {
+        compute_cost(
+            &self.model,
+            self.input_tokens,
+            self.output_tokens,
+            self.cache_read_tokens,
+            self.cache_write_tokens,
+        )
+    }
+}
+
+/// Find all JSONL files across all provider directories (matching token-usage skill)
+fn find_jsonl_files() -> Vec<PathBuf> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut files = Vec::new();
+
+    // Collect all provider directories: ~/.claude, ~/.claude-*, etc.
+    let mut provider_dirs: Vec<PathBuf> = Vec::new();
+
+    // Standard provider
+    let standard = PathBuf::from(&home).join(".claude");
+    if standard.exists() && standard.join("projects").exists() {
+        provider_dirs.push(standard);
     }
 
-    let Ok(entries) = std::fs::read_dir(&logs_dir) else {
-        return aggregated;
+    // Additional providers: ~/.claude-*/*/projects
+    if let Ok(entries) = std::fs::read_dir(&home) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with(".claude-") && entry.path().is_dir() {
+                let projects = entry.path().join("projects");
+                if projects.exists() {
+                    provider_dirs.push(entry.path());
+                }
+            }
+        }
+    }
+
+    for provider_dir in provider_dirs {
+        let projects_dir = provider_dir.join("projects");
+        if let Ok(entries) = std::fs::read_dir(&projects_dir) {
+            for entry in entries.flatten() {
+                let project_path = entry.path();
+                if project_path.is_dir() {
+                    if let Ok(jsonl_entries) = std::fs::read_dir(&project_path) {
+                        for jsonl_entry in jsonl_entries.flatten() {
+                            let path = jsonl_entry.path();
+                            if path.extension().map(|e| e == "jsonl").unwrap_or(false) {
+                                files.push(path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    files
+}
+
+/// Process a single JSONL file and extract usage records
+fn process_jsonl_file(path: &Path) -> Vec<UsageRecord> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
     };
 
-    let today = Utc::now().date_naive();
-    let mut hourly_tokens: HashMap<i64, u64> = HashMap::new();
+    // Derive provider, project, session_id from path
+    let home = std::env::var("HOME").unwrap_or_default();
+    let rel_path_raw = path.to_string_lossy().replace(&home, "");
+    let rel_path = rel_path_raw.trim_start_matches('/');
+    let parts: Vec<&str> = rel_path.split('/').collect();
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path
-            .file_name()
-            .map(|n| n.to_string_lossy().starts_with("tokens-"))
-            .unwrap_or(false)
-        {
+    let provider = if parts.first().map(|s| s.starts_with(".claude-")).unwrap_or(false) {
+        parts.first().unwrap_or(&".claude").to_string()
+    } else {
+        ".claude".to_string()
+    };
+
+    // project is between "projects" and filename
+    let project = if let Some(idx) = parts.iter().position(|s| *s == "projects") {
+        parts.get(idx + 1).unwrap_or(&"").to_string()
+    } else {
+        String::new()
+    };
+
+    let session_id = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let mut records: Vec<UsageRecord> = Vec::new();
+    let mut seen_uuids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for line in content.lines() {
+        if line.trim().is_empty() {
             continue;
         }
 
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
+        // Parse as JSON
+        if let Ok(msg) = serde_json::from_str::<JsonlMessage>(line) {
+            if msg.msg_type == "assistant" {
+                // Deduplicate by uuid (skip if already seen)
+                if let Some(ref uuid) = msg.uuid {
+                    if seen_uuids.contains(uuid) {
+                        continue;
+                    }
+                    seen_uuids.insert(uuid.clone());
+                }
 
-        for line in content.lines() {
-            let parts: Vec<&str> = line.split('|').collect();
-            if parts.len() < 7 {
-                continue;
-            }
+                if let Some(ref message) = msg.message {
+                    if let Some(ref usage) = message.usage {
+                        let model = message
+                            .model
+                            .as_deref()
+                            .unwrap_or("unknown")
+                            .to_string();
 
-            let timestamp = match parse_timestamp(parts[0]) {
-                Some(ts) => ts,
-                None => continue,
-            };
+                        let input = usage.input_tokens.unwrap_or(0);
+                        let output = usage.output_tokens.unwrap_or(0);
+                        let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
+                        let cache_write = usage.cache_creation_input_tokens.unwrap_or(0);
 
-            let model = parts[1].to_string();
-            let input_tokens: u64 = parts[2].parse().unwrap_or(0);
-            let output_tokens: u64 = parts[3].parse().unwrap_or(0);
-            let cache_tokens: u64 = parts[4].parse().unwrap_or(0);
-            let total_tokens: u64 = parts[5].parse().unwrap_or(0);
-            let cost: f64 = parts[6].parse().unwrap_or(0.0);
-
-            aggregated.total_tokens += total_tokens;
-            aggregated.total_cost += cost;
-
-            let hour_key = timestamp.timestamp() / 3600;
-            *hourly_tokens.entry(hour_key).or_insert(0) += total_tokens;
-
-            if timestamp.date_naive() == today {
-                aggregated.today_tokens += total_tokens;
-                aggregated.today_cost += cost;
-                aggregated.entries_today.push(TokenUsageEntry {
-                    timestamp,
-                    model,
-                    input_tokens,
-                    output_tokens,
-                    cache_tokens,
-                    total_tokens,
-                    cost,
-                });
+                        if input > 0 || output > 0 || cache_read > 0 || cache_write > 0 {
+                            records.push(UsageRecord {
+                                session_id: session_id.clone(),
+                                date: msg.timestamp.clone().unwrap_or_default(),
+                                provider: provider.clone(),
+                                project: project.clone(),
+                                model,
+                                input_tokens: input,
+                                output_tokens: output,
+                                cache_read_tokens: cache_read,
+                                cache_write_tokens: cache_write,
+                                total_tokens: input + output + cache_read + cache_write,
+                                message_count: 1,
+                            });
+                        }
+                    }
+                }
             }
         }
     }
 
+    records
+}
+
+/// Aggregate usage records by session+model+date (matching token-usage skill)
+fn aggregate_usage(records: Vec<UsageRecord>) -> Vec<UsageRecord> {
+    use std::collections::HashMap;
+
+    let mut aggregated: HashMap<String, UsageRecord> = HashMap::new();
+
+    for record in records {
+        let key = format!(
+            "{}|{}|{}|{}|{}",
+            record.session_id, record.date, record.provider, record.project, record.model
+        );
+
+        let entry = aggregated.entry(key).or_insert_with(|| UsageRecord {
+            session_id: record.session_id.clone(),
+            date: record.date.clone(),
+            provider: record.provider.clone(),
+            project: record.project.clone(),
+            model: record.model.clone(),
+            ..Default::default()
+        });
+
+        entry.input_tokens += record.input_tokens;
+        entry.output_tokens += record.output_tokens;
+        entry.cache_read_tokens += record.cache_read_tokens;
+        entry.cache_write_tokens += record.cache_write_tokens;
+        entry.total_tokens += record.total_tokens;
+        entry.message_count += record.message_count;
+    }
+
+    aggregated.into_values().collect()
+}
+
+/// Scan all JSONL files and compute aggregated costs (matching token-usage skill cost mode)
+fn scan_all_usage() -> AggregatedTokens {
+    let files = find_jsonl_files();
+
+    let mut all_records: Vec<UsageRecord> = Vec::new();
+    for path in files {
+        all_records.extend(process_jsonl_file(&path));
+    }
+
+    let aggregated = aggregate_usage(all_records);
+
+    let today = Utc::now().date_naive();
+
+    let mut result = AggregatedTokens::default();
+    let mut hourly_tokens: std::collections::HashMap<i64, u64> = std::collections::HashMap::new();
+
+    for record in aggregated {
+        let cost = record.cost();
+
+        // All-time totals
+        result.total_tokens += record.total_tokens;
+        result.total_cost += cost;
+        result.total_input += record.input_tokens;
+        result.total_output += record.output_tokens;
+        result.total_cache_read += record.cache_read_tokens;
+        result.total_cache_write += record.cache_write_tokens;
+
+        // Parse timestamp for daily grouping (use UTC to handle timezone offsets correctly)
+        if let Ok(ts) = DateTime::parse_from_rfc3339(&record.date) {
+            let utc_date = ts.with_timezone(&Utc).date_naive();
+            if utc_date == today {
+                result.today_tokens += record.total_tokens;
+                result.today_cost += cost;
+                result.today_input += record.input_tokens;
+                result.today_output += record.output_tokens;
+                result.today_cache_read += record.cache_read_tokens;
+                result.today_cache_write += record.cache_write_tokens;
+            }
+        }
+
+        // Hourly rate (for charts if needed)
+        if let Ok(ts) = DateTime::parse_from_rfc3339(&record.date) {
+            let hour_key = ts.timestamp() / 3600;
+            *hourly_tokens.entry(hour_key).or_insert(0) += record.total_tokens;
+        }
+    }
+
+    // Build 24-hour rate array
     let now_hour = Utc::now().timestamp() / 3600;
     for i in 0..24 {
         let hour = now_hour - i;
-        aggregated
-            .hourly_rates
-            .push(hourly_tokens.get(&hour).copied().unwrap_or(0));
+        result.hourly_rates.push(hourly_tokens.get(&hour).copied().unwrap_or(0));
     }
-    aggregated.hourly_rates.reverse();
-    aggregated
-        .entries_today
-        .sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-    // entries_today is used for model breakdown — keep all entries for today, limit to last 50 for display
-    aggregated.entries_today.truncate(50);
+    result.hourly_rates.reverse();
 
-    aggregated
+    result
 }
 
 // ============================================================================
@@ -841,26 +1194,83 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
     };
 
     let token_str = format_tokens(state.aggregated_tokens.today_tokens);
+    let cost_str = if state.aggregated_tokens.today_cost > 0.0 {
+        format!("${:.2}", state.aggregated_tokens.today_cost)
+    } else {
+        String::new()
+    };
 
-    let line = Line::from(
-        vec![
-            Span::raw("  claudeboard  ").set_style(
-                Style::default()
-                    .fg(colors::ACCENT)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(&clock).set_style(Style::default().fg(colors::PRIMARY)),
-            Span::raw("  ").set_style(Style::default()),
-            Span::raw(&countdown).set_style(Style::default().fg(colors::SECONDARY)),
-            Span::raw("  ").set_style(Style::default()),
+    let mut header_spans: Vec<Span<'_>> = vec![
+        Span::raw("  claudeboard  ").set_style(
+            Style::default()
+                .fg(colors::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(&clock).set_style(Style::default().fg(colors::PRIMARY)),
+        Span::raw("  ").set_style(Style::default()),
+        Span::raw(&countdown).set_style(Style::default().fg(colors::SECONDARY)),
+        Span::raw("  ").set_style(Style::default()),
+    ];
+    // Show today's token breakdown: input in, output out, cache cache, cw cw, cost
+    if state.aggregated_tokens.today_input > 0 || state.aggregated_tokens.today_output > 0 {
+        header_spans.push(
+            Span::raw(format_tokens(state.aggregated_tokens.today_input))
+                .set_style(Style::default().fg(colors::YELLOW)),
+        );
+        header_spans.push(
+            Span::raw(" in, ").set_style(Style::default().fg(colors::SECONDARY)),
+        );
+        header_spans.push(
+            Span::raw(format_tokens(state.aggregated_tokens.today_output))
+                .set_style(Style::default().fg(colors::YELLOW)),
+        );
+        header_spans.push(
+            Span::raw(" out, ").set_style(Style::default().fg(colors::SECONDARY)),
+        );
+        if state.aggregated_tokens.today_cache_read > 0 {
+            header_spans.push(
+                Span::raw(format_tokens(state.aggregated_tokens.today_cache_read))
+                    .set_style(Style::default().fg(colors::PURPLE)),
+            );
+            header_spans.push(
+                Span::raw(" cache, ").set_style(Style::default().fg(colors::SECONDARY)),
+            );
+        }
+        if state.aggregated_tokens.today_cache_write > 0 {
+            header_spans.push(
+                Span::raw(format_tokens(state.aggregated_tokens.today_cache_write))
+                    .set_style(Style::default().fg(colors::CYAN)),
+            );
+            header_spans.push(
+                Span::raw(" cw, ").set_style(Style::default().fg(colors::SECONDARY)),
+            );
+        }
+        if !cost_str.is_empty() {
+            header_spans.push(
+                Span::raw(cost_str.clone()).set_style(Style::default().fg(colors::GREEN)),
+            );
+        }
+    } else {
+        // Fallback to simple token count
+        header_spans.push(
             Span::raw(&token_str).set_style(Style::default().fg(colors::YELLOW)),
-            Span::raw(" today").set_style(Style::default().fg(colors::SECONDARY)),
-            Span::raw("     ").set_style(Style::default().fg(colors::SURFACE)),
-        ]
-        .into_iter()
-        .chain(status_line)
-        .collect::<Vec<_>>(),
-    );
+        );
+        header_spans.push(
+            Span::raw(" tokens").set_style(Style::default().fg(colors::SECONDARY)),
+        );
+        if !cost_str.is_empty() {
+            header_spans.push(
+                Span::raw("  ").set_style(Style::default()),
+            );
+            header_spans.push(
+                Span::raw(&cost_str).set_style(Style::default().fg(colors::GREEN)),
+            );
+        }
+    }
+    header_spans.push(Span::raw("     ").set_style(Style::default().fg(colors::SURFACE)));
+    header_spans.extend(status_line);
+
+    let line = Line::from(header_spans);
 
     f.render_widget(
         Paragraph::new(line).set_style(Style::default().bg(colors::SURFACE)),
@@ -1730,7 +2140,18 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState) {
     f.render_widget(block, area);
 
     let pane_count = state.agent_pane_count;
-    let token_str = format_tokens(state.aggregated_tokens.total_tokens);
+
+    // Format cost with proper precision
+    let today_cost_str = if state.aggregated_tokens.today_cost > 0.0 {
+        format!("${:.4}", state.aggregated_tokens.today_cost)
+    } else {
+        String::new()
+    };
+    let total_cost_str = if state.aggregated_tokens.total_cost > 0.0 {
+        format!("${:.2}", state.aggregated_tokens.total_cost)
+    } else {
+        String::new()
+    };
 
     // Count sessions by status
     let in_progress = state
@@ -1791,30 +2212,66 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &AppState) {
         parts.join(" ")
     };
 
-    let right = [
-        Span::raw(format!("{} agent panes", pane_count))
+    // Right side: matching /cost format
+    // {n} panes · {status} · today: {input} in, {output} out, {cache} cache, {cw} cw (${cost})
+    // total: {input} in, {output} out, {cache} cache, {cw} cw (${cost})
+    let today_in = format_tokens(state.aggregated_tokens.today_input);
+    let today_out = format_tokens(state.aggregated_tokens.today_output);
+    let today_cr = format_tokens(state.aggregated_tokens.today_cache_read);
+    let today_cw = format_tokens(state.aggregated_tokens.today_cache_write);
+
+    let total_in = format_tokens(state.aggregated_tokens.total_input);
+    let total_out = format_tokens(state.aggregated_tokens.total_output);
+    let total_cr = format_tokens(state.aggregated_tokens.total_cache_read);
+    let total_cw = format_tokens(state.aggregated_tokens.total_cache_write);
+
+    let mut right: Vec<Span<'_>> = vec![
+        Span::raw(format!("{} panes", pane_count))
             .set_style(Style::default().fg(colors::CYAN)),
         Span::raw(" · ").set_style(Style::default().fg(colors::SECONDARY)),
-        Span::raw(&status_parts).set_style(Style::default().fg(colors::PRIMARY)),
-        Span::raw(" · ").set_style(Style::default().fg(colors::SECONDARY)),
-        Span::raw(&token_str).set_style(Style::default().fg(colors::YELLOW)),
-        Span::raw(" total").set_style(Style::default().fg(colors::SECONDARY)),
+        Span::raw(status_parts.clone()).set_style(Style::default().fg(colors::PRIMARY)),
+        Span::raw(" · today: ").set_style(Style::default().fg(colors::SECONDARY)),
+        Span::raw(today_in).set_style(Style::default().fg(colors::YELLOW)),
+        Span::raw(" in, ").set_style(Style::default().fg(colors::SECONDARY)),
+        Span::raw(today_out).set_style(Style::default().fg(colors::YELLOW)),
+        Span::raw(" out, ").set_style(Style::default().fg(colors::SECONDARY)),
     ];
+    if state.aggregated_tokens.today_cache_read > 0 {
+        right.push(Span::raw(today_cr).set_style(Style::default().fg(colors::PURPLE)));
+        right.push(Span::raw(" cache, ").set_style(Style::default().fg(colors::SECONDARY)));
+    }
+    if state.aggregated_tokens.today_cache_write > 0 {
+        right.push(Span::raw(today_cw).set_style(Style::default().fg(colors::CYAN)));
+        right.push(Span::raw(" cw, ").set_style(Style::default().fg(colors::SECONDARY)));
+    }
+    if !today_cost_str.is_empty() {
+        right.push(Span::raw(today_cost_str).set_style(Style::default().fg(colors::GREEN)));
+    }
+    right.push(Span::raw(" · total: ").set_style(Style::default().fg(colors::SECONDARY)));
+    right.push(Span::raw(total_in).set_style(Style::default().fg(colors::SECONDARY)));
+    right.push(Span::raw(" in, ").set_style(Style::default().fg(colors::SECONDARY)));
+    right.push(Span::raw(total_out).set_style(Style::default().fg(colors::SECONDARY)));
+    right.push(Span::raw(" out, ").set_style(Style::default().fg(colors::SECONDARY)));
+    if state.aggregated_tokens.total_cache_read > 0 {
+        right.push(Span::raw(total_cr).set_style(Style::default().fg(colors::PURPLE)));
+        right.push(Span::raw(" cache, ").set_style(Style::default().fg(colors::SECONDARY)));
+    }
+    if state.aggregated_tokens.total_cache_write > 0 {
+        right.push(Span::raw(total_cw).set_style(Style::default().fg(colors::CYAN)));
+        right.push(Span::raw(" cw, ").set_style(Style::default().fg(colors::SECONDARY)));
+    }
+    if !total_cost_str.is_empty() {
+        right.push(Span::raw(total_cost_str).set_style(Style::default().fg(colors::SECONDARY)));
+    }
 
-    let line = Line::from(vec![
-        left[0].clone(),
-        left[1].clone(),
-        left[2].clone(),
-        left[3].clone(),
-        left[4].clone(),
+    let mut line_spans: Vec<Span<'_>> = Vec::new();
+    line_spans.extend(left.iter().cloned());
+    line_spans.push(
         Span::raw("                    ").set_style(Style::default().fg(colors::SURFACE)),
-        right[0].clone(),
-        right[1].clone(),
-        right[2].clone(),
-        right[3].clone(),
-        right[4].clone(),
-        right[5].clone(),
-    ]);
+    );
+    line_spans.extend(right);
+
+    let line = Line::from(line_spans);
 
     f.render_widget(
         Paragraph::new(line).set_style(Style::default().bg(colors::SURFACE)),
@@ -1917,7 +2374,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await
                 .unwrap_or_default();
 
-                let tokens = tokio::task::spawn_blocking(parse_token_logs)
+                let tokens = tokio::task::spawn_blocking(scan_all_usage)
                     .await
                     .unwrap_or_default();
 
