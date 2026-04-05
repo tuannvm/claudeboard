@@ -11,7 +11,7 @@ Implement GitHub Actions CI/CD workflows for the `claude-watch` Rust project, mo
 Create `.github/workflows/` directory with the following workflows:
 
 #### 1. `build.yml` - Build & Verify Pipeline
-Trigger on: push to main, pull requests
+Trigger on: push to master, pull requests
 Jobs:
 - **verify**: Code quality checks (cargo fmt --check, cargo clippy, cargo check)
 - **security**: Security scanning (cargo-audit, cargo-deny if available)
@@ -119,7 +119,7 @@ You are inside a **Ralph loop**. Each iteration:
    - **P2** (design, performance) → add to Open below
    - **P3** (minor, style) → append to Findings Log below
 6. **Update state**: increment `iteration` in `state.json`, set `"phase": "implementing"`
-7. **Transition check`: All action items done AND zero P1s? → set `"phase": "testing"` and continue to Testing Gate
+7. **Transition check**: All action items done AND zero P1s? → set `"phase": "testing"` and continue to Testing Gate
 
 ### Testing Gate
 
@@ -184,7 +184,7 @@ cargo build --release
 ```
 
 **Output:**
-```
+```text
 running 0 tests
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
