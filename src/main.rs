@@ -323,7 +323,11 @@ fn get_fallback_rates(model: &str) -> ModelPricing {
 impl LiteLLMPricing {
     /// Load pricing from cache file, fetching if stale
     pub fn load() -> Self {
-        let cache_dir = PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        let cache_dir = std::env::var("HOME")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
             .join(".cache")
             .join("claude-pricing");
         let cache_file = cache_dir.join("litellm-pricing.json");
