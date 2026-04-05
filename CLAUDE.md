@@ -3,7 +3,7 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Build
-- `cargo build --release` — build binary to `target/release/claude-watch`
+- `cargo build --release` — build binary to `target/release/claudeboard`
 - `cargo check` — type check without full build
 
 ## UTF-8 Safety

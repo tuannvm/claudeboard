@@ -41,7 +41,7 @@ fn truncate_from_end(s: &str, max_chars: usize) -> String {
 // ============================================================================
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "claude-watch")]
+#[command(name = "claudeboard")]
 #[command(about = "TUI dashboard for monitoring Claude Code via tmux")]
 struct Args {
     #[arg(long, default_value = "5", help = "Refresh interval in seconds")]
@@ -844,7 +844,7 @@ fn render_header(f: &mut Frame, area: Rect, state: &AppState) {
 
     let line = Line::from(
         vec![
-            Span::raw("  claude-watch  ").set_style(
+            Span::raw("  claudeboard  ").set_style(
                 Style::default()
                     .fg(colors::ACCENT)
                     .add_modifier(Modifier::BOLD),
@@ -1011,7 +1011,7 @@ fn render_tmux_panel(f: &mut Frame, area: Rect, state: &AppState) {
                     })
                     .unwrap_or((None, None));
 
-                // Build pane label: use running_cmd (version like "2.1.89" or "claude-watch") as primary,
+                // Build pane label: use running_cmd (version like "2.1.89" or "claudeboard") as primary,
                 // title as secondary info in parentheses if different
                 let pane_label = if let Some(ref cmd) = pane.running_cmd {
                     if let Some(ref title) = pane.pane_title {

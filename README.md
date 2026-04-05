@@ -11,7 +11,7 @@ cargo install --path .
 ## Usage
 
 ```bash
-claude-watch
+claudeboard
 ```
 
 ## Features
