@@ -127,6 +127,7 @@ pub struct Session {
     pub message_counts: MessageCounts,
     pub token_counts: TokenCounts,
     pub queue_ops: Vec<QueueOp>,
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -576,6 +577,7 @@ fn parse_session_jsonl(path: &Path, project: &str, project_path: &Path) -> Optio
     let mut last_cwd = String::new();
     let mut last_branch: Option<String> = None;
     let mut last_active = Utc::now();
+    let mut last_model: Option<String> = None;
 
     for line in content.lines() {
         if line.trim().is_empty() {
@@ -593,6 +595,12 @@ fn parse_session_jsonl(path: &Path, project: &str, project_path: &Path) -> Optio
         match msg.msg_type.as_str() {
             "assistant" => {
                 message_counts.assistant += 1;
+                // Capture latest model from assistant messages
+                if let Some(ref m) = msg.message {
+                    if let Some(ref model) = m.model {
+                        last_model = Some(model.clone());
+                    }
+                }
                 // Only skip the Claude home dir; real project paths get stored
                 if let Some(ref cwd) = msg.cwd {
                     let home = std::env::var("HOME").unwrap_or_default();
@@ -652,6 +660,7 @@ fn parse_session_jsonl(path: &Path, project: &str, project_path: &Path) -> Optio
         message_counts,
         token_counts,
         queue_ops,
+        model: last_model,
     })
 }
 
@@ -1943,6 +1952,16 @@ fn render_session_metadata(f: &mut Frame, area: Rect, state: &AppState) {
                 ]),
             ];
 
+            // Show model if available
+            if let Some(ref model) = session.model {
+                if let Some(model_display) = model.split('/').last() {
+                    lines.push(Line::from(vec![
+                        Span::raw("  model: ").set_style(Style::default().fg(colors::SECONDARY)),
+                        Span::raw(model_display).set_style(Style::default().fg(colors::GREEN)),
+                    ]));
+                }
+            }
+
             // Truncate cwd
             let cwd_display = if session.cwd.chars().count() > 35 {
                 format!("...{}", truncate_from_end(&session.cwd, 32))
@@ -2015,6 +2034,23 @@ fn render_session_metadata(f: &mut Frame, area: Rect, state: &AppState) {
                 let cache_total = session.token_counts.cache_read_input_tokens
                     + session.token_counts.cache_creation_input_tokens;
                 lines.push(Line::from(draw_bar(cache_total, colors::PURPLE, "cache")));
+
+                // Show session cost if model is available
+                if let Some(ref model) = session.model {
+                    let cost = compute_cost(
+                        model,
+                        session.token_counts.input_tokens,
+                        session.token_counts.output_tokens,
+                        session.token_counts.cache_read_input_tokens,
+                        session.token_counts.cache_creation_input_tokens,
+                    );
+                    if cost > 0.0 {
+                        lines.push(Line::from(vec![
+                            Span::raw("  cost: ").set_style(Style::default().fg(colors::SECONDARY)),
+                            Span::raw(format!("${:.2}", cost)).set_style(Style::default().fg(colors::GREEN)),
+                        ]));
+                    }
+                }
             } else {
                 lines.push(Line::from(vec![
                     Span::raw("  — no token data")
@@ -2051,6 +2087,7 @@ fn render_session_metadata(f: &mut Frame, area: Rect, state: &AppState) {
                     ]));
                 }
             } else {
+                // Show each queue op
                 for op in session.queue_ops.iter().rev().take(6) {
                     let icon = queue_op_icon(&op.operation);
                     let icon_color = queue_op_color(&op.operation);
@@ -2063,6 +2100,32 @@ fn render_session_metadata(f: &mut Frame, area: Rect, state: &AppState) {
                         Span::raw("] ").set_style(Style::default().fg(colors::SECONDARY)),
                         Span::raw(&op.operation).set_style(Style::default().fg(colors::PRIMARY)),
                     ]));
+                }
+
+                // Show ops velocity and session age based on visible ops spread
+                // iter().rev() gives us newest-first, so first()=newest, last()=oldest
+                if session.queue_ops.len() >= 2 {
+                    let recent_ops: Vec<&QueueOp> = session.queue_ops.iter().rev().take(6).collect();
+                    if let (Some(newest), Some(oldest)) = (recent_ops.first(), recent_ops.last()) {
+                        let span_seconds = (newest.timestamp - oldest.timestamp).num_seconds();
+                        if span_seconds > 0 {
+                            let ops_count = recent_ops.len() as f64;
+                            let velocity = ops_count / (span_seconds as f64 / 60.0);
+                            lines.push(Line::from(vec![
+                                Span::raw("  velocity: ").set_style(Style::default().fg(colors::SECONDARY)),
+                                Span::raw(format!("{:.1}", velocity)).set_style(Style::default().fg(colors::GREEN)),
+                                Span::raw(" ops/m").set_style(Style::default().fg(colors::SECONDARY)),
+                            ]));
+
+                            let age_minutes = span_seconds / 60;
+                            if age_minutes > 0 {
+                                lines.push(Line::from(vec![
+                                    Span::raw("  age: ").set_style(Style::default().fg(colors::SECONDARY)),
+                                    Span::raw(format!("{}m", age_minutes)).set_style(Style::default().fg(colors::CYAN)),
+                                ]));
+                            }
+                        }
+                    }
                 }
             }
 
