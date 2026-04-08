@@ -128,6 +128,8 @@ pub struct Session {
     pub token_counts: TokenCounts,
     pub queue_ops: Vec<QueueOp>,
     pub model: Option<String>,
+    pub last_user_msg: Option<DateTime<Utc>>,
+    pub last_asst_msg: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -459,6 +461,8 @@ struct MessageContent {
     usage: Option<Usage>,
     #[serde(rename = "model")]
     model: Option<String>,
+    #[serde(rename = "content")]
+    content: Option<serde_json::Value>, // Can be string or array
 }
 
 #[derive(Debug, Deserialize)]
@@ -578,6 +582,8 @@ fn parse_session_jsonl(path: &Path, project: &str, project_path: &Path) -> Optio
     let mut last_branch: Option<String> = None;
     let mut last_active = Utc::now();
     let mut last_model: Option<String> = None;
+    let mut last_user_msg: Option<DateTime<Utc>> = None;
+    let mut last_asst_msg: Option<DateTime<Utc>> = None;
 
     for line in content.lines() {
         if line.trim().is_empty() {
@@ -595,7 +601,10 @@ fn parse_session_jsonl(path: &Path, project: &str, project_path: &Path) -> Optio
         match msg.msg_type.as_str() {
             "assistant" => {
                 message_counts.assistant += 1;
-                // Capture latest model from assistant messages
+                // Capture timestamp and latest model from assistant messages
+                if let Some(ts) = msg.timestamp.as_ref().and_then(|s| parse_timestamp(s)) {
+                    last_asst_msg = Some(ts);
+                }
                 if let Some(ref m) = msg.message {
                     if let Some(ref model) = m.model {
                         last_model = Some(model.clone());
@@ -622,6 +631,29 @@ fn parse_session_jsonl(path: &Path, project: &str, project_path: &Path) -> Optio
             }
             "user" => {
                 message_counts.user += 1;
+                // Capture user message timestamp only if it's not a tool result
+                // Tool results have all content blocks with type "tool_result"
+                // Content can be string (normal msg) or array (tool_result or mixed)
+                let is_tool_result = msg.message.as_ref()
+                    .and_then(|m| m.content.as_ref())
+                    .map(|v| {
+                        if let Some(arr) = v.as_array() {
+                            arr.iter().all(|item| {
+                                item.get("type")
+                                    .and_then(|t| t.as_str())
+                                    .map(|t| t == "tool_result")
+                                    .unwrap_or(false)
+                            })
+                        } else {
+                            false // String content means it's a normal user message
+                        }
+                    })
+                    .unwrap_or(false);
+                if !is_tool_result {
+                    if let Some(ts) = msg.timestamp.as_ref().and_then(|s| parse_timestamp(s)) {
+                        last_user_msg = Some(ts);
+                    }
+                }
                 // Skip only ~/.claude and $HOME; real project paths get stored
                 if let Some(ref cwd) = msg.cwd {
                     let home = std::env::var("HOME").unwrap_or_default();
@@ -661,6 +693,8 @@ fn parse_session_jsonl(path: &Path, project: &str, project_path: &Path) -> Optio
         token_counts,
         queue_ops,
         model: last_model,
+        last_user_msg,
+        last_asst_msg,
     })
 }
 
@@ -1633,6 +1667,63 @@ fn render_tmux_panel(f: &mut Frame, area: Rect, state: &AppState) {
 // Tmux Pane Capture
 // ============================================================================
 
+/// Extract the last Claude response from raw pane lines.
+/// Claude responses appear between ██████ markers and user `> ` prompts.
+/// Returns only the content of the last Claude message, filtered.
+fn filter_last_claude_response(lines: &[String]) -> Vec<String> {
+    if lines.is_empty() {
+        return vec![];
+    }
+
+    // Find the last user prompt line (`> ` at start of line)
+    let last_user_prompt = lines.iter().enumerate().rev().find(|(_, l)| l.starts_with("> "));
+
+    // Find the last ██████ boundary marker (claude response start)
+    let last_boundary = lines
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, l)| l.contains("██████"));
+
+    match (last_boundary, last_user_prompt) {
+        (Some((b_idx, _)), Some((u_idx, _))) if b_idx < u_idx => {
+            // Claude response exists before user prompt — extract it.
+            // Skip the ██████ line itself, capture content up to (but not including) the last `> `.
+            // We take all lines after boundary, then truncate at the LAST `> ` to avoid
+            // stopping at Markdown blockquotes that may appear inside the response.
+            let after_boundary: Vec<&String> = lines.iter().skip(b_idx + 1).collect();
+            let last_prompt = after_boundary.iter().enumerate().rev().find(|(_, l)| l.starts_with("> "));
+            let end_idx = last_prompt.map(|(i, _)| i).unwrap_or(after_boundary.len());
+            after_boundary
+                .iter()
+                .take(end_idx)
+                .map(|l| l.to_string())
+                .collect()
+        }
+        (Some((b_idx, _)), None) => {
+            // No user prompt after — capture from last boundary to end (streaming response)
+            lines.iter().skip(b_idx + 1).map(|l| l.to_string()).collect()
+        }
+        (Some((b_idx, _)), Some((u_idx, _))) if b_idx > u_idx => {
+            // Boundary is after the user prompt — response is streaming in.
+            // Capture everything after the boundary (partial/in-progress response).
+            lines.iter().skip(b_idx + 1).map(|l| l.to_string()).collect()
+        }
+        (None, Some(_)) => {
+            // No ██████ boundary found — either session just started (no response yet)
+            // or the boundary scrolled above the capture window. Without a boundary marker
+            // we cannot reliably show just the last response, so return empty.
+            vec![]
+        }
+        (None, None) => {
+            // No boundary, no user prompt — return all
+            lines.to_vec()
+        }
+        // Remaining: b_idx == u_idx (prompt at same line as boundary) or edge cases
+        _ => vec![],
+    }
+}
+
 /// Capture the visible content of a tmux pane using capture-pane
 fn capture_pane_content(
     socket: &Option<String>,
@@ -1804,21 +1895,38 @@ fn render_live_pane(f: &mut Frame, area: Rect, state: &AppState) {
                         .set_style(Style::default().fg(colors::SECONDARY)),
                 ]));
             } else {
-                // Show last N lines of pane content, truncated to fit width
-                let max_lines = (inner.height as usize).saturating_sub(3).max(1);
-                let max_chars = (inner.width as usize).saturating_sub(4).max(10);
-                for line_text in lines.iter().rev().take(max_lines).rev() {
-                    let display = if line_text.chars().count() > max_chars {
-                        let limit = max_chars.saturating_sub(3);
-                        let truncated: String = line_text.chars().take(limit).collect();
-                        format!("{}...", truncated)
-                    } else {
-                        line_text.clone()
-                    };
+                // Only filter for Claude panes (which use ██████ boundaries).
+                // Non-Claude agents (Codex, Gemini) don't have these markers — show all.
+                let is_claude_pane = pane_label.contains("claude");
+                let display_lines = if is_claude_pane {
+                    filter_last_claude_response(&lines)
+                } else {
+                    lines.clone()
+                };
+
+                if display_lines.is_empty() && is_claude_pane {
                     all_lines.push(Line::from(vec![
-                        Span::raw("  ").set_style(Style::default().fg(colors::SECONDARY)),
-                        Span::raw(display).set_style(Style::default().fg(colors::PRIMARY)),
+                        Span::raw("  [response scrolled off]")
+                            .set_style(Style::default().fg(colors::SECONDARY)),
                     ]));
+                } else {
+                    let max_lines = (inner.height as usize).saturating_sub(3).max(1);
+                    let max_chars = (inner.width as usize).saturating_sub(4).max(10);
+                    // Show last N lines, truncated to fit width
+                    for line_text in display_lines.iter().rev().take(max_lines).rev() {
+                        let display = if line_text.chars().count() > max_chars {
+                            let limit = max_chars.saturating_sub(3);
+                            let truncated: String = line_text.chars().take(limit).collect();
+                            format!("{}...", truncated)
+                        } else {
+                            line_text.clone()
+                        };
+                        all_lines.push(Line::from(vec![
+                            Span::raw("  ").set_style(Style::default().fg(colors::SECONDARY)),
+                            Span::raw(display)
+                                .set_style(Style::default().fg(colors::PRIMARY)),
+                        ]));
+                    }
                 }
             }
 
@@ -1932,6 +2040,16 @@ fn render_session_metadata(f: &mut Frame, area: Rect, state: &AppState) {
                 format!("{}m ago", idle_min)
             };
 
+            // Compute user and assistant idle times
+            let user_idle_str = session.last_user_msg.map(|ts| {
+                let m = (Utc::now() - ts).num_minutes();
+                if m < 1 { "now".to_string() } else { format!("{}m", m) }
+            }).unwrap_or_else(|| "—".to_string());
+            let asst_idle_str = session.last_asst_msg.map(|ts| {
+                let m = (Utc::now() - ts).num_minutes();
+                if m < 1 { "now".to_string() } else { format!("{}m", m) }
+            }).unwrap_or_else(|| "—".to_string());
+
             let mut lines: Vec<Line> = vec![
                 Line::from(vec![
                     Span::raw(status_icon).set_style(Style::default().fg(status_color)),
@@ -1949,6 +2067,10 @@ fn render_session_metadata(f: &mut Frame, area: Rect, state: &AppState) {
                     Span::raw(&session.id).set_style(Style::default().fg(colors::CYAN)),
                     Span::raw(" · last: ").set_style(Style::default().fg(colors::SECONDARY)),
                     Span::raw(&idle_str).set_style(Style::default().fg(colors::YELLOW)),
+                    Span::raw(" · you: ").set_style(Style::default().fg(colors::SECONDARY)),
+                    Span::raw(&user_idle_str).set_style(Style::default().fg(colors::CYAN)),
+                    Span::raw(" · asst: ").set_style(Style::default().fg(colors::SECONDARY)),
+                    Span::raw(&asst_idle_str).set_style(Style::default().fg(colors::GREEN)),
                 ]),
             ];
 
@@ -2035,6 +2157,30 @@ fn render_session_metadata(f: &mut Frame, area: Rect, state: &AppState) {
                     + session.token_counts.cache_creation_input_tokens;
                 lines.push(Line::from(draw_bar(cache_total, colors::PURPLE, "cache")));
 
+                // Show cache hit ratio if we have cache reads
+                if session.token_counts.cache_read_input_tokens > 0 {
+                    // cache_hit = cache_read / (input + cache_read)
+                    // cache_creation is excluded since it's a write, not a read
+                    let total_in = session.token_counts.input_tokens
+                        + session.token_counts.cache_read_input_tokens;
+                    if total_in > 0 {
+                        let cache_ratio = session.token_counts.cache_read_input_tokens as f64 / total_in as f64;
+                        lines.push(Line::from(vec![
+                            Span::raw("  cache hit: ").set_style(Style::default().fg(colors::SECONDARY)),
+                            Span::raw(format!("{:.0}%", cache_ratio * 100.0)).set_style(Style::default().fg(colors::PURPLE)),
+                        ]));
+                    }
+                }
+
+                // Show output/input ratio
+                if session.token_counts.input_tokens > 0 {
+                    let ratio = session.token_counts.output_tokens as f64 / session.token_counts.input_tokens as f64;
+                    lines.push(Line::from(vec![
+                        Span::raw("  out/in: ").set_style(Style::default().fg(colors::SECONDARY)),
+                        Span::raw(format!("{:.1}", ratio)).set_style(Style::default().fg(colors::YELLOW)),
+                    ]));
+                }
+
                 // Show session cost if model is available
                 if let Some(ref model) = session.model {
                     let cost = compute_cost(
@@ -2087,6 +2233,29 @@ fn render_session_metadata(f: &mut Frame, area: Rect, state: &AppState) {
                     ]));
                 }
             } else {
+                // Show current op status prominently
+                if let Some(current_op) = session.queue_ops.last() {
+                    let icon = queue_op_icon(&current_op.operation);
+                    let icon_color = queue_op_color(&current_op.operation);
+                    let time_str = current_op.timestamp.format("%H:%M:%S").to_string();
+                    lines.push(Line::from(vec![
+                        Span::raw("  now: ").set_style(Style::default().fg(colors::SECONDARY)),
+                        Span::raw(icon).set_style(Style::default().fg(icon_color)),
+                        Span::raw(" ").set_style(Style::default()),
+                        Span::raw(&current_op.operation).set_style(Style::default().fg(icon_color)),
+                        Span::raw(" [").set_style(Style::default().fg(colors::SECONDARY)),
+                        Span::raw(time_str).set_style(Style::default().fg(colors::CYAN)),
+                        Span::raw("]").set_style(Style::default().fg(colors::SECONDARY)),
+                    ]));
+                }
+
+                // Show queue depth
+                let total_ops = session.queue_ops.len();
+                lines.push(Line::from(vec![
+                    Span::raw("  ops: ").set_style(Style::default().fg(colors::SECONDARY)),
+                    Span::raw(format!("{}", total_ops)).set_style(Style::default().fg(colors::YELLOW)),
+                ]));
+
                 // Show each queue op
                 for op in session.queue_ops.iter().rev().take(6) {
                     let icon = queue_op_icon(&op.operation);
@@ -2549,5 +2718,86 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_filter_last_claude_response_basic() {
+        // Simple case: boundary, response, then prompt
+        let lines = vec![
+            "previous stuff".to_string(),
+            "██████".to_string(),
+            "Claude's response line 1".to_string(),
+            "Claude's response line 2".to_string(),
+            "> ".to_string(),
+            "next prompt".to_string(),
+        ];
+        let result = filter_last_claude_response(&lines);
+        assert_eq!(result, vec!["Claude's response line 1", "Claude's response line 2"]);
+    }
+
+    #[test]
+    fn test_filter_last_claude_response_no_boundary() {
+        // No boundary - should return empty (can't extract reliably)
+        let lines = vec![
+            "some content".to_string(),
+            "> ".to_string(),
+        ];
+        let result = filter_last_claude_response(&lines);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_filter_last_claude_response_streaming() {
+        // Boundary AFTER prompt = streaming response in progress
+        let lines = vec![
+            "old stuff".to_string(),
+            "> ".to_string(),
+            "██████".to_string(),
+            "partial response".to_string(),
+        ];
+        let result = filter_last_claude_response(&lines);
+        assert_eq!(result, vec!["partial response"]);
+    }
+
+    #[test]
+    fn test_filter_last_claude_response_with_blockquotes() {
+        // Claude response containing Markdown blockquotes - should NOT truncate at blockquotes
+        let lines = vec![
+            "██████".to_string(),
+            "Here's the plan:".to_string(),
+            "> quote from previous".to_string(),
+            "More of Claude's response".to_string(),
+            "> ".to_string(),
+        ];
+        let result = filter_last_claude_response(&lines);
+        // Should capture all content before the LAST > prompt
+        assert_eq!(result, vec!["Here's the plan:", "> quote from previous", "More of Claude's response"]);
+    }
+
+    #[test]
+    fn test_filter_last_claude_response_only_boundary_no_prompt() {
+        // Boundary present but no user prompt after - streaming/no-prompt-yet case
+        let lines = vec![
+            "██████".to_string(),
+            "Claude's response".to_string(),
+        ];
+        let result = filter_last_claude_response(&lines);
+        assert_eq!(result, vec!["Claude's response"]);
+    }
+
+    #[test]
+    fn test_filter_last_claude_response_boundary_at_same_line() {
+        // Boundary and prompt at same position - waiting for response
+        let lines = vec![
+            "stuff".to_string(),
+            "██████ > ".to_string(),
+        ];
+        let result = filter_last_claude_response(&lines);
+        assert!(result.is_empty());
     }
 }
