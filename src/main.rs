@@ -1,4 +1,5 @@
 use chrono::{DateTime, TimeDelta, Utc};
+use std::cmp::Reverse;
 use clap::Parser;
 use crossterm::event::{KeyCode, KeyEventKind};
 use crossterm::terminal::{
@@ -183,14 +184,19 @@ pub struct TmuxPane {
     pub pane_dead: bool, // true if pane is dead (process exited)
 }
 
-/// Check if a pane is running a coding agent (Claude Code, Codex, or Gemini)
-/// Uses only the running_cmd (foreground process) - does NOT use pane_title.
-/// This relies on the actual command binary name being detected.
+/// Check if a pane is running a coding agent (Claude Code, Codex, or Gemini).
+/// Primary signal is running_cmd; for wrapped launches (bash/node/npx/etc) fall back to pane_title.
 fn is_coding_agent(pane: &TmuxPane) -> bool {
     // Dead panes are not running anything
     if pane.pane_dead {
         return false;
     }
+
+    let title = pane.pane_title.as_deref().unwrap_or_default().to_lowercase();
+    let title_has_agent = has_word_token(&title, "claude")
+        || has_word_token(&title, "codex")
+        || has_word_token(&title, "gemini")
+        || has_word_token(&title, "anthropic");
 
     // Check running_cmd - this is the primary indicator of what's actually running
     if let Some(ref cmd) = pane.running_cmd {
@@ -217,12 +223,283 @@ fn is_coding_agent(pane: &TmuxPane) -> bool {
                 && parts[0].chars().all(|c| c.is_ascii_digit())
         };
 
-        if is_version || is_agent_cmd {
+        if is_agent_cmd {
+            return true;
+        }
+
+        if is_version {
+            return true;
+        }
+
+        // Wrapped launches often report shell/runtime in running_cmd.
+        let is_wrapper_cmd = matches!(
+            cmd_basename.as_str(),
+            "bash"
+                | "zsh"
+                | "sh"
+                | "fish"
+                | "node"
+                | "python"
+                | "python3"
+                | "env"
+                | "bun"
+                | "npm"
+                | "npx"
+                | "pnpm"
+                | "yarn"
+                | "uvx"
+                | "pipx"
+        );
+        if is_wrapper_cmd && title_has_agent {
             return true;
         }
     }
 
     false
+}
+
+fn has_word_token(text: &str, token: &str) -> bool {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .any(|t| t.eq_ignore_ascii_case(token))
+}
+
+fn is_likely_claude_pane(pane: &TmuxPane) -> bool {
+    let cmd_opt = pane.running_cmd.as_deref();
+    let cmd_lower = cmd_opt.unwrap_or_default().to_lowercase();
+
+    let cmd_basename = std::path::Path::new(&cmd_lower)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&cmd_lower);
+
+    let title = pane.pane_title.as_deref().unwrap_or_default().to_lowercase();
+    let title_has_claude = has_word_token(&title, "claude")
+        && !has_word_token(&title, "codex")
+        && !has_word_token(&title, "gemini");
+
+    if cmd_basename.contains("codex") || cmd_basename.contains("gemini") {
+        return false;
+    }
+
+    if cmd_basename.contains("claude") || cmd_basename.contains("anthropic") {
+        return true;
+    }
+
+    // Claude sometimes reports version-only running_cmd (e.g. 2.1.89)
+    let is_version_only = {
+        let parts: Vec<&str> = cmd_basename.split('.').collect();
+        parts.len() >= 2 && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+    };
+    if is_version_only {
+        return title_has_claude;
+    }
+
+    // Wrapped launches often show shell/runtime as running_cmd; use title fallback there.
+    let is_wrapper_cmd = matches!(
+        cmd_basename,
+        "bash"
+            | "zsh"
+            | "sh"
+            | "fish"
+            | "node"
+            | "python"
+            | "python3"
+            | "bun"
+            | "env"
+            | "npm"
+            | "npx"
+            | "pnpm"
+            | "yarn"
+            | "uvx"
+            | "pipx"
+    );
+    if cmd_opt.is_none() || is_wrapper_cmd {
+        return title_has_claude;
+    }
+
+    false
+}
+
+fn pane_title_has_token(title: &str, token: &str) -> bool {
+    has_word_token(title, token)
+}
+
+fn coding_agent_signal_strength(pane: &TmuxPane) -> u8 {
+    let title = pane.pane_title.as_deref().unwrap_or_default().to_lowercase();
+    let title_has_agent = pane_title_has_token(&title, "claude")
+        || pane_title_has_token(&title, "codex")
+        || pane_title_has_token(&title, "gemini")
+        || pane_title_has_token(&title, "anthropic");
+
+    let cmd = pane.running_cmd.as_deref().unwrap_or_default().to_lowercase();
+    let cmd_basename = std::path::Path::new(&cmd)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&cmd);
+
+    if cmd_basename.contains("claude")
+        || cmd_basename.contains("codex")
+        || cmd_basename.contains("gemini")
+        || cmd_basename.contains("anthropic")
+    {
+        return 3;
+    }
+
+    let is_version_only = {
+        let parts: Vec<&str> = cmd_basename.split('.').collect();
+        parts.len() >= 2 && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+    };
+    if is_version_only {
+        return if title_has_agent { 2 } else { 1 };
+    }
+
+    let is_wrapper_cmd = matches!(
+        cmd_basename,
+        "bash"
+            | "zsh"
+            | "sh"
+            | "fish"
+            | "node"
+            | "python"
+            | "python3"
+            | "env"
+            | "bun"
+            | "npm"
+            | "npx"
+            | "pnpm"
+            | "yarn"
+            | "uvx"
+            | "pipx"
+    );
+
+    if is_wrapper_cmd && title_has_agent {
+        return 1;
+    }
+
+    0
+}
+
+fn is_selectable_agent_pane(pane: &TmuxPane, matched: bool) -> Option<u8> {
+    if !is_coding_agent(pane) {
+        return None;
+    }
+
+    let strength = coding_agent_signal_strength(pane);
+    if strength == 0 {
+        return None;
+    }
+
+    if matched {
+        return Some(strength);
+    }
+
+    // Keep unmatched wrapped-agent fallback enabled so active wrapper-launched panes
+    // remain selectable when JSONL matching is unavailable.
+    Some(strength)
+}
+
+fn session_status_rank(status: SessionStatus) -> u8 {
+    match status {
+        SessionStatus::InProgress => 3,
+        SessionStatus::Pending => 2,
+        SessionStatus::Idle => 1,
+        SessionStatus::Done | SessionStatus::Error => 0,
+    }
+}
+
+fn pane_numeric_id(pane_id: &str) -> Option<u32> {
+    pane_id.trim_start_matches('%').parse::<u32>().ok()
+}
+
+fn active_agent_candidates(state: &AppState) -> Vec<(PaneKey, TmuxPane, bool, u8, u8)> {
+    let Some(ws) = state.tmux_workspace.as_ref() else {
+        return Vec::new();
+    };
+
+    let mut candidates: Vec<(PaneKey, TmuxPane, bool, u8, u8)> = ws
+        .sessions
+        .iter()
+        .flat_map(|s| {
+            s.panes
+                .iter()
+                .filter_map(|p| {
+                    let key = PaneKey {
+                        session: s.name.clone(),
+                        window: p.window_name.clone(),
+                        pane: p.pane_id.clone(),
+                    };
+
+                    if let Some(&idx) = state.session_by_pane.get(&key)
+                        && let Some(session) = state.sessions.get(idx)
+                    {
+                        let strength = is_selectable_agent_pane(p, true)?;
+                        return Some((
+                            key,
+                            p.clone(),
+                            true,
+                            session_status_rank(session.status),
+                            strength,
+                        ));
+                    }
+
+                    let strength = is_selectable_agent_pane(p, false)?;
+                    Some((key, p.clone(), false, 0, strength))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    candidates.sort_by_key(|(k, _, matched, status_rank, strength)| {
+        (
+            Reverse(*matched),
+            Reverse(*status_rank),
+            Reverse(*strength),
+            k.session.clone(),
+            k.window.clone(),
+            pane_numeric_id(&k.pane).unwrap_or(u32::MAX),
+            k.pane.clone(),
+        )
+    });
+
+    candidates
+}
+
+fn resolve_selected_index(previous_keys: &[PaneKey], previous_idx: usize, new_keys: &[PaneKey]) -> usize {
+    if new_keys.is_empty() {
+        return 0;
+    }
+
+    if let Some(prev_key) = previous_keys.get(previous_idx)
+        && let Some(new_idx) = new_keys.iter().position(|k| k == prev_key)
+    {
+        return new_idx;
+    }
+
+    previous_idx.min(new_keys.len().saturating_sub(1))
+}
+
+fn select_active_agent_pane(state: &AppState) -> Option<(PaneKey, TmuxPane)> {
+    let candidates = active_agent_candidates(state);
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let idx = state.selected_pane_idx.min(candidates.len().saturating_sub(1));
+
+    if idx == 0
+        && let Some((k, p, _, _, _)) = candidates
+            .iter()
+            .find(|(_, _, matched, status_rank, _)| *matched && *status_rank == 3)
+            .cloned()
+    {
+        return Some((k, p));
+    }
+
+    candidates
+        .into_iter()
+        .nth(idx)
+        .map(|(k, p, _, _, _)| (k, p))
 }
 
 #[derive(Debug, Clone)]
@@ -1333,6 +1610,125 @@ enum TmuxTreeEntry {
     },
 }
 
+fn format_tmux_pane_label(pane: &TmuxPane) -> String {
+    if let Some(ref cmd) = pane.running_cmd {
+        if let Some(ref title) = pane.pane_title {
+            if title.as_str() != pane.window_name && !title.contains(cmd) {
+                format!("{} ({})", cmd, title)
+            } else {
+                cmd.clone()
+            }
+        } else {
+            cmd.clone()
+        }
+    } else {
+        pane.pane_title
+            .clone()
+            .unwrap_or_else(|| pane.window_name.clone())
+    }
+}
+
+fn build_tmux_tree_entries(state: &AppState) -> Vec<TmuxTreeEntry> {
+    let candidates = active_agent_candidates(state);
+
+    struct PaneEntry {
+        pane_key: PaneKey,
+        pane_label: String,
+        repo: Option<String>,
+        branch: Option<String>,
+    }
+
+    struct WindowEntry {
+        session: String,
+        name: String,
+        index: String,
+        panes: Vec<PaneEntry>,
+    }
+
+    struct SessionEntry {
+        name: String,
+        windows: Vec<WindowEntry>,
+    }
+
+    let mut sessions: Vec<SessionEntry> = Vec::new();
+    let mut session_idx_by_name: HashMap<String, usize> = HashMap::new();
+    let mut window_idx_by_session_and_name: HashMap<(String, String), usize> = HashMap::new();
+
+    for (pane_key, pane, _, _, _) in candidates {
+        let (repo, branch) = state
+            .session_by_pane
+            .get(&pane_key)
+            .and_then(|&idx| state.sessions.get(idx))
+            .map(|s| {
+                let repo = std::path::Path::new(&s.cwd)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| s.project.clone());
+                (Some(repo), s.git_branch.clone())
+            })
+            .unwrap_or((None, None));
+
+        let session_idx = if let Some(&idx) = session_idx_by_name.get(&pane_key.session) {
+            idx
+        } else {
+            let idx = sessions.len();
+            sessions.push(SessionEntry {
+                name: pane_key.session.clone(),
+                windows: Vec::new(),
+            });
+            session_idx_by_name.insert(pane_key.session.clone(), idx);
+            idx
+        };
+
+        let window_key = (pane_key.session.clone(), pane_key.window.clone());
+        let window_idx = if let Some(&idx) = window_idx_by_session_and_name.get(&window_key) {
+            idx
+        } else {
+            let idx = sessions[session_idx].windows.len();
+            sessions[session_idx].windows.push(WindowEntry {
+                session: pane_key.session.clone(),
+                name: pane_key.window.clone(),
+                index: pane.window_index.clone(),
+                panes: Vec::new(),
+            });
+            window_idx_by_session_and_name.insert(window_key, idx);
+            idx
+        };
+
+        sessions[session_idx].windows[window_idx].panes.push(PaneEntry {
+            pane_key,
+            pane_label: format_tmux_pane_label(&pane),
+            repo,
+            branch,
+        });
+    }
+
+    let mut tree: Vec<TmuxTreeEntry> = Vec::new();
+    for session in sessions {
+        tree.push(TmuxTreeEntry::Session {
+            name: session.name.clone(),
+        });
+        for window in session.windows {
+            tree.push(TmuxTreeEntry::Window {
+                session: window.session,
+                name: window.name,
+                index: window.index,
+            });
+            for pane in window.panes {
+                tree.push(TmuxTreeEntry::Pane {
+                    pane_key: pane.pane_key,
+                    pane_label: pane.pane_label,
+                    repo: pane.repo,
+                    branch: pane.branch,
+                });
+            }
+        }
+    }
+
+    tree
+}
+
 fn render_tmux_panel(f: &mut Frame, area: Rect, state: &AppState) {
     let block = Block::new()
         .title(" ⎔ tmux ")
@@ -1362,151 +1758,29 @@ fn render_tmux_panel(f: &mut Frame, area: Rect, state: &AppState) {
         return;
     }
 
-    // ── Build flat list of agent pane entries (for linear navigation index) ──
-    // Only include panes that are running coding agents
-    let all_panes: Vec<PaneKey> = ws
-        .sessions
-        .iter()
-        .flat_map(|s| {
-            s.panes
-                .iter()
-                .filter(|p| is_coding_agent(p))
-                .map(|p| PaneKey {
-                    session: s.name.clone(),
-                    window: p.window_name.clone(),
-                    pane: p.pane_id.clone(),
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect();
+    let selected_pane_key = select_active_agent_pane(state).map(|(k, _)| k);
 
-    let total_panes = all_panes.len();
-    let selected_pane_idx = state.selected_pane_idx.min(total_panes.saturating_sub(1));
-    let selected_pane_key = all_panes.get(selected_pane_idx).cloned();
+    // ── Build tree entries for all active coding agent panes ─────────────────
+    let tree = build_tmux_tree_entries(state);
 
-    // ── Build tree entries (only sessions/windows/panes with agents) ─────────
-    let mut tree: Vec<TmuxTreeEntry> = Vec::new();
-    let mut pane_flat_index: Vec<PaneKey> = Vec::new();
-
-    for session in &ws.sessions {
-        // Collect agent panes for this session
-        let agent_panes: Vec<&TmuxPane> = session
-            .panes
-            .iter()
-            .filter(|p| is_coding_agent(p))
-            .collect();
-
-        // Skip session if no agent panes
-        if agent_panes.is_empty() {
-            continue;
-        }
-
-        tree.push(TmuxTreeEntry::Session {
-            name: session.name.clone(),
-        });
-
-        // Group panes by window (preserving order)
-        let mut panes_by_window: Vec<(String, String, Vec<&TmuxPane>)> = Vec::new();
-        let mut seen_windows: Vec<String> = Vec::new();
-        for pane in &agent_panes {
-            if !seen_windows.contains(&pane.window_name) {
-                seen_windows.push(pane.window_name.clone());
-                panes_by_window.push((
-                    pane.window_name.clone(),
-                    pane.window_index.clone(),
-                    Vec::new(),
-                ));
-            }
-            let group = panes_by_window
-                .iter_mut()
-                .find(|(name, _, _)| name == &pane.window_name);
-            if let Some((_, _, panes)) = group {
-                panes.push(pane);
-            }
-        }
-
-        for (window_name, window_index, window_panes) in panes_by_window.into_iter() {
-            // Always add window header for clarity
-            tree.push(TmuxTreeEntry::Window {
-                session: session.name.clone(),
-                name: window_name.clone(),
-                index: window_index.clone(),
-            });
-
-            // Panes under this window
-            for pane in window_panes.iter() {
-                let pane_key = PaneKey {
-                    session: session.name.clone(),
-                    window: window_name.clone(),
-                    pane: pane.pane_id.clone(),
-                };
-                pane_flat_index.push(pane_key.clone());
-
-                // Look up Claude session via session_by_pane
-                let (repo, branch) = state
-                    .session_by_pane
-                    .get(&pane_key)
-                    .and_then(|&idx| state.sessions.get(idx))
-                    .map(|s| {
-                        // Derive real project name from cwd: /Users/tuannvm/project/cli/claudeboard → claudeboard
-                        let repo = std::path::Path::new(&s.cwd)
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .map(|n| n.to_string())
-                            .unwrap_or_else(|| s.project.clone());
-                        (Some(repo), s.git_branch.clone())
-                    })
-                    .unwrap_or((None, None));
-
-                // Build pane label: use running_cmd (version like "2.1.89" or "claudeboard") as primary,
-                // title as secondary info in parentheses if different
-                let pane_label = if let Some(ref cmd) = pane.running_cmd {
-                    if let Some(ref title) = pane.pane_title {
-                        if title.as_str() != pane.window_name && !title.contains(cmd) {
-                            format!("{} ({})", cmd, title)
-                        } else {
-                            cmd.clone()
-                        }
-                    } else {
-                        cmd.clone()
-                    }
-                } else {
-                    pane.pane_title
-                        .clone()
-                        .unwrap_or_else(|| pane.window_name.clone())
-                };
-
-                tree.push(TmuxTreeEntry::Pane {
-                    pane_key,
-                    pane_label,
-                    repo,
-                    branch,
-                });
-            }
-        }
+    if tree.is_empty() {
+        let msg = Paragraph::new("  no active coding agent pane")
+            .set_style(Style::default().fg(colors::SECONDARY));
+        f.render_widget(msg, inner);
+        return;
     }
 
     let total_lines = tree.len();
 
     // ── Determine visible window ─────────────────────────────────────────────
-    // Map selected_pane_idx (in all_panes) to an index in pane_flat_index
-    let pane_line_idx: Option<usize> = selected_pane_key
-        .as_ref()
-        .and_then(|pk| pane_flat_index.iter().position(|k| k == pk));
-
     // Find which tree line corresponds to the selected pane
-    let selected_tree_idx = pane_line_idx.and_then(|pfi| {
-        tree.iter()
-            .enumerate()
-            .filter_map(|(idx, entry)| {
-                if let TmuxTreeEntry::Pane { pane_key, .. } = entry
-                    && pane_flat_index.iter().position(|k| k == pane_key) == Some(pfi)
-                {
-                    return Some(idx);
-                }
-                None
-            })
-            .next()
+    let selected_tree_idx = selected_pane_key.as_ref().and_then(|selected_key| {
+        tree.iter().position(|entry| {
+            matches!(
+                entry,
+                TmuxTreeEntry::Pane { pane_key, .. } if pane_key == selected_key
+            )
+        })
     });
 
     // ── Render with viewport ─────────────────────────────────────────────────
@@ -1578,10 +1852,13 @@ fn render_tmux_panel(f: &mut Frame, area: Rect, state: &AppState) {
                 let _pane_idx_in_tree = idx;
 
                 // Is this the last pane in its window?
-                // Look ahead to find the next entry that is a Window or Session
-                let is_last_in_window = !tree[idx + 1..]
-                    .iter()
-                    .any(|e| matches!(e, TmuxTreeEntry::Pane { .. }));
+                let is_last_in_window = !tree[idx + 1..].iter().any(|e| {
+                    matches!(
+                        e,
+                        TmuxTreeEntry::Pane { pane_key: next_key, .. }
+                            if next_key.session == pane_key.session && next_key.window == pane_key.window
+                    )
+                });
 
                 // Use proper tree branch characters
                 let tree_char = if is_last_in_window {
@@ -1670,9 +1947,34 @@ fn render_tmux_panel(f: &mut Frame, area: Rect, state: &AppState) {
 /// Extract the last Claude response from raw pane lines.
 /// Claude responses appear between ██████ markers and user `> ` prompts.
 /// Returns only the content of the last Claude message, filtered.
+fn pane_has_claude_boundary(lines: &[String]) -> bool {
+    lines.iter().any(|l| l.contains("██████"))
+}
+
 fn filter_last_claude_response(lines: &[String]) -> Vec<String> {
     if lines.is_empty() {
         return vec![];
+    }
+
+    // Normalize captured lines and trim leading/trailing empty lines to keep response glanceable.
+    fn normalize_for_display(lines: Vec<String>) -> Vec<String> {
+        if lines.is_empty() {
+            return lines;
+        }
+
+        let normalized: Vec<String> = lines.into_iter().map(|l| l.replace('\r', "")).collect();
+
+        let mut start = 0;
+        let mut end = normalized.len();
+
+        while start < end && normalized[start].trim().is_empty() {
+            start += 1;
+        }
+        while end > start && normalized[end - 1].trim().is_empty() {
+            end -= 1;
+        }
+
+        normalized[start..end].to_vec()
     }
 
     // Find the last user prompt line (`> ` at start of line)
@@ -1685,14 +1987,18 @@ fn filter_last_claude_response(lines: &[String]) -> Vec<String> {
         .rev()
         .find(|(_, l)| l.contains("██████"));
 
-    match (last_boundary, last_user_prompt) {
+    let extracted = match (last_boundary, last_user_prompt) {
         (Some((b_idx, _)), Some((u_idx, _))) if b_idx < u_idx => {
             // Claude response exists before user prompt — extract it.
             // Skip the ██████ line itself, capture content up to (but not including) the last `> `.
             // We take all lines after boundary, then truncate at the LAST `> ` to avoid
             // stopping at Markdown blockquotes that may appear inside the response.
             let after_boundary: Vec<&String> = lines.iter().skip(b_idx + 1).collect();
-            let last_prompt = after_boundary.iter().enumerate().rev().find(|(_, l)| l.starts_with("> "));
+            let last_prompt = after_boundary
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, l)| l.starts_with("> "));
             let end_idx = last_prompt.map(|(i, _)| i).unwrap_or(after_boundary.len());
             after_boundary
                 .iter()
@@ -1721,7 +2027,9 @@ fn filter_last_claude_response(lines: &[String]) -> Vec<String> {
         }
         // Remaining: b_idx == u_idx (prompt at same line as boundary) or edge cases
         _ => vec![],
-    }
+    };
+
+    normalize_for_display(extracted)
 }
 
 /// Capture the visible content of a tmux pane using capture-pane
@@ -1744,7 +2052,7 @@ fn capture_pane_content(
         for arg in &socket_args {
             cmd.arg(arg);
         }
-        cmd.args(["capture-pane", "-t", &target, "-p", "-S", "-50"]);
+        cmd.args(["capture-pane", "-t", &target, "-p", "-S", "-200"]);
         cmd.output()
     };
 
@@ -1776,46 +2084,10 @@ fn render_live_pane(f: &mut Frame, area: Rect, state: &AppState) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // Get selected pane info
-    let (pane_key, pane_info): (PaneKey, Option<TmuxPane>) =
-        if let Some(ref ws) = state.tmux_workspace {
-            let all_agent_panes: Vec<(PaneKey, TmuxPane)> = ws
-                .sessions
-                .iter()
-                .flat_map(|s| {
-                    s.panes
-                        .iter()
-                        .filter(|p| is_coding_agent(p))
-                        .map(|p| {
-                            let key = PaneKey {
-                                session: s.name.clone(),
-                                window: p.window_name.clone(),
-                                pane: p.pane_id.clone(),
-                            };
-                            (key, p.clone())
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect();
-
-            let selected = state
-                .selected_pane_idx
-                .min(all_agent_panes.len().saturating_sub(1));
-            all_agent_panes
-                .into_iter()
-                .nth(selected)
-                .map(|(k, p)| (k, Some(p)))
-                .unwrap_or_else(|| {
-                    (
-                        PaneKey {
-                            session: String::new(),
-                            window: String::new(),
-                            pane: String::new(),
-                        },
-                        None,
-                    )
-                })
-        } else {
+    // Get active coding-agent pane info
+    let (pane_key, pane_info): (PaneKey, Option<TmuxPane>) = select_active_agent_pane(state)
+        .map(|(k, p)| (k, Some(p)))
+        .unwrap_or_else(|| {
             (
                 PaneKey {
                     session: String::new(),
@@ -1824,7 +2096,7 @@ fn render_live_pane(f: &mut Frame, area: Rect, state: &AppState) {
                 },
                 None,
             )
-        };
+        });
 
     // Live poll indicator
     let poll_str = if pane_info.is_some() {
@@ -1895,9 +2167,9 @@ fn render_live_pane(f: &mut Frame, area: Rect, state: &AppState) {
                         .set_style(Style::default().fg(colors::SECONDARY)),
                 ]));
             } else {
-                // Only filter for Claude panes (which use ██████ boundaries).
-                // Non-Claude agents (Codex, Gemini) don't have these markers — show all.
-                let is_claude_pane = pane_label.contains("claude");
+                // Filter only when pane output itself contains Claude boundary markers.
+                // This avoids stale-title false positives while still supporting wrapped launches.
+                let is_claude_pane = pane_has_claude_boundary(&lines) && is_likely_claude_pane(&pane);
                 let display_lines = if is_claude_pane {
                     filter_last_claude_response(&lines)
                 } else {
@@ -1906,7 +2178,7 @@ fn render_live_pane(f: &mut Frame, area: Rect, state: &AppState) {
 
                 if display_lines.is_empty() && is_claude_pane {
                     all_lines.push(Line::from(vec![
-                        Span::raw("  [response scrolled off]")
+                        Span::raw("  [no recent Claude response in captured pane content]")
                             .set_style(Style::default().fg(colors::SECONDARY)),
                     ]));
                 } else {
@@ -1969,46 +2241,10 @@ fn render_session_metadata(f: &mut Frame, area: Rect, state: &AppState) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // Get selected pane info and corresponding session
-    let (pane_key, pane_info): (PaneKey, Option<TmuxPane>) =
-        if let Some(ref ws) = state.tmux_workspace {
-            let all_agent_panes: Vec<(PaneKey, TmuxPane)> = ws
-                .sessions
-                .iter()
-                .flat_map(|s| {
-                    s.panes
-                        .iter()
-                        .filter(|p| is_coding_agent(p))
-                        .map(|p| {
-                            let key = PaneKey {
-                                session: s.name.clone(),
-                                window: p.window_name.clone(),
-                                pane: p.pane_id.clone(),
-                            };
-                            (key, p.clone())
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect();
-
-            let selected = state
-                .selected_pane_idx
-                .min(all_agent_panes.len().saturating_sub(1));
-            all_agent_panes
-                .into_iter()
-                .nth(selected)
-                .map(|(k, p)| (k, Some(p)))
-                .unwrap_or_else(|| {
-                    (
-                        PaneKey {
-                            session: String::new(),
-                            window: String::new(),
-                            pane: String::new(),
-                        },
-                        None,
-                    )
-                })
-        } else {
+    // Get active coding-agent pane info and corresponding session
+    let (pane_key, pane_info): (PaneKey, Option<TmuxPane>) = select_active_agent_pane(state)
+        .map(|(k, p)| (k, Some(p)))
+        .unwrap_or_else(|| {
             (
                 PaneKey {
                     session: String::new(),
@@ -2017,7 +2253,7 @@ fn render_session_metadata(f: &mut Frame, area: Rect, state: &AppState) {
                 },
                 None,
             )
-        };
+        });
 
     let session = state
         .session_by_pane
@@ -2607,17 +2843,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Strategy 2: Match by project name if pane.cwd ends with the session's project dir name
                 // The project name is more reliable than cwd because JSONL cwd is often ~/.claude
                 let mut session_by_pane = HashMap::new();
-                let mut agent_pane_count = 0;
                 if let Some(ref ws) = tmux_ws {
-                    // First pass: count agent panes (across all tmux sessions once)
-                    for tmux_session in &ws.sessions {
-                        for pane in &tmux_session.panes {
-                            if is_coding_agent(pane) {
-                                agent_pane_count += 1;
-                            }
-                        }
-                    }
-                    // Second pass: match panes to sessions
+                    // Match panes to parsed Claude sessions
                     for (sess_idx, session) in sessions.iter().enumerate() {
                         for tmux_session in &ws.sessions {
                             for pane in &tmux_session.panes {
@@ -2656,18 +2883,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
+
                 }
 
-                let selected = state_clone.read().selected_pane_idx;
+                let (selected, previous_keys) = {
+                    let s = state_clone.read();
+                    let previous_keys = active_agent_candidates(&s)
+                        .into_iter()
+                        .map(|(k, _, _, _, _)| k)
+                        .collect::<Vec<_>>();
+                    (s.selected_pane_idx, previous_keys)
+                };
 
                 let mut s = state_clone.write();
                 s.sessions = sessions;
                 s.aggregated_tokens = tokens;
                 s.tmux_workspace = tmux_ws;
                 s.session_by_pane = session_by_pane;
-                s.agent_pane_count = agent_pane_count;
-                // Clamp selected pane index to available agent panes
-                s.selected_pane_idx = selected.min(agent_pane_count.saturating_sub(1));
+
+                let candidates = active_agent_candidates(&s);
+                let new_keys = candidates
+                    .iter()
+                    .map(|(k, _, _, _, _)| k.clone())
+                    .collect::<Vec<_>>();
+
+                s.agent_pane_count = candidates.len();
+                s.selected_pane_idx = resolve_selected_index(&previous_keys, selected, &new_keys);
             }
 
             state_clone.write().refresh_countdown = countdown;
@@ -2799,5 +3040,1327 @@ mod tests {
         ];
         let result = filter_last_claude_response(&lines);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_filter_last_claude_response_trims_blank_edges() {
+        let lines = vec![
+            "██████".to_string(),
+            "".to_string(),
+            "  ".to_string(),
+            "Claude response".to_string(),
+            "".to_string(),
+            "> ".to_string(),
+        ];
+        let result = filter_last_claude_response(&lines);
+        assert_eq!(result, vec!["Claude response"]);
+    }
+
+    #[test]
+    fn test_is_likely_claude_pane_claude_cmd() {
+        let pane = TmuxPane {
+            pane_id: "%1".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s".to_string(),
+            cwd: "/tmp".to_string(),
+            running_cmd: Some("claude".to_string()),
+            pane_title: Some("irrelevant".to_string()),
+            pane_dead: false,
+        };
+        assert!(is_likely_claude_pane(&pane));
+    }
+
+    #[test]
+    fn test_is_likely_claude_pane_non_claude_cmd() {
+        let pane = TmuxPane {
+            pane_id: "%1".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s".to_string(),
+            cwd: "/tmp".to_string(),
+            running_cmd: Some("codex".to_string()),
+            pane_title: Some("claude".to_string()),
+            pane_dead: false,
+        };
+        assert!(!is_likely_claude_pane(&pane));
+    }
+
+    #[test]
+    fn test_is_likely_claude_pane_version_with_title_fallback() {
+        let pane = TmuxPane {
+            pane_id: "%1".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s".to_string(),
+            cwd: "/tmp".to_string(),
+            running_cmd: Some("2.1.89".to_string()),
+            pane_title: Some("Claude Code".to_string()),
+            pane_dead: false,
+        };
+        assert!(is_likely_claude_pane(&pane));
+    }
+
+    #[test]
+    fn test_is_likely_claude_pane_version_without_claude_title_is_false() {
+        let pane = TmuxPane {
+            pane_id: "%1".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s".to_string(),
+            cwd: "/tmp".to_string(),
+            running_cmd: Some("2.1.89".to_string()),
+            pane_title: Some("shell".to_string()),
+            pane_dead: false,
+        };
+        assert!(!is_likely_claude_pane(&pane));
+    }
+
+    #[test]
+    fn test_is_likely_claude_pane_does_not_use_title_when_cmd_exists() {
+        let pane = TmuxPane {
+            pane_id: "%1".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s".to_string(),
+            cwd: "/tmp".to_string(),
+            running_cmd: Some("top".to_string()),
+            pane_title: Some("claude".to_string()),
+            pane_dead: false,
+        };
+        assert!(!is_likely_claude_pane(&pane));
+    }
+
+    #[test]
+    fn test_is_likely_claude_pane_uses_title_for_wrapper_cmd() {
+        let pane = TmuxPane {
+            pane_id: "%1".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s".to_string(),
+            cwd: "/tmp".to_string(),
+            running_cmd: Some("bash".to_string()),
+            pane_title: Some("claude".to_string()),
+            pane_dead: false,
+        };
+        assert!(is_likely_claude_pane(&pane));
+    }
+
+    #[test]
+    fn test_is_likely_claude_pane_uses_title_for_npx_wrapper_cmd() {
+        let pane = TmuxPane {
+            pane_id: "%1".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s".to_string(),
+            cwd: "/tmp".to_string(),
+            running_cmd: Some("npx".to_string()),
+            pane_title: Some("claude".to_string()),
+            pane_dead: false,
+        };
+        assert!(is_likely_claude_pane(&pane));
+    }
+
+    #[test]
+    fn test_is_coding_agent_wrapper_cmd_with_claude_title() {
+        let pane = TmuxPane {
+            pane_id: "%1".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s".to_string(),
+            cwd: "/tmp".to_string(),
+            running_cmd: Some("npx".to_string()),
+            pane_title: Some("claude".to_string()),
+            pane_dead: false,
+        };
+        assert!(is_coding_agent(&pane));
+    }
+
+    #[test]
+    fn test_is_coding_agent_shell_cmd_with_claude_title_is_true() {
+        let pane = TmuxPane {
+            pane_id: "%1".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s".to_string(),
+            cwd: "/tmp".to_string(),
+            running_cmd: Some("bash".to_string()),
+            pane_title: Some("claude".to_string()),
+            pane_dead: false,
+        };
+        assert!(is_coding_agent(&pane));
+    }
+
+    #[test]
+    fn test_is_coding_agent_shell_cmd_with_non_agent_title_is_false() {
+        let pane = TmuxPane {
+            pane_id: "%1".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s".to_string(),
+            cwd: "/tmp".to_string(),
+            running_cmd: Some("bash".to_string()),
+            pane_title: Some("shell".to_string()),
+            pane_dead: false,
+        };
+        assert!(!is_coding_agent(&pane));
+    }
+
+    #[test]
+    fn test_is_coding_agent_version_is_agent_without_title() {
+        let pane = TmuxPane {
+            pane_id: "%1".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s".to_string(),
+            cwd: "/tmp".to_string(),
+            running_cmd: Some("2.1.89".to_string()),
+            pane_title: Some("shell".to_string()),
+            pane_dead: false,
+        };
+        assert!(is_coding_agent(&pane));
+    }
+
+    #[test]
+    fn test_is_coding_agent_version_with_agent_title() {
+        let pane = TmuxPane {
+            pane_id: "%1".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s".to_string(),
+            cwd: "/tmp".to_string(),
+            running_cmd: Some("2.1.89".to_string()),
+            pane_title: Some("claude".to_string()),
+            pane_dead: false,
+        };
+        assert!(is_coding_agent(&pane));
+    }
+
+    #[test]
+    fn test_filter_last_claude_response_normalizes_carriage_returns() {
+        let lines = vec![
+            "██████".to_string(),
+            "line one\r".to_string(),
+            "line two\r".to_string(),
+            "> ".to_string(),
+        ];
+        let result = filter_last_claude_response(&lines);
+        assert_eq!(result, vec!["line one", "line two"]);
+    }
+
+    #[test]
+    fn test_has_word_token_requires_whole_token() {
+        assert!(has_word_token("claude", "claude"));
+        assert!(has_word_token("run claude now", "claude"));
+        assert!(!has_word_token("myclaudepane", "claude"));
+    }
+
+    #[test]
+    fn test_pane_has_claude_boundary() {
+        let with_boundary = vec!["foo".to_string(), "██████".to_string()];
+        let without_boundary = vec!["foo".to_string(), "bar".to_string()];
+        assert!(pane_has_claude_boundary(&with_boundary));
+        assert!(!pane_has_claude_boundary(&without_boundary));
+    }
+
+    #[test]
+    fn test_coding_agent_signal_strength_prefers_direct_agent_cmd() {
+        let pane = TmuxPane {
+            pane_id: "%1".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s".to_string(),
+            cwd: "/tmp".to_string(),
+            running_cmd: Some("claude".to_string()),
+            pane_title: Some("shell".to_string()),
+            pane_dead: false,
+        };
+        assert_eq!(coding_agent_signal_strength(&pane), 3);
+    }
+
+    #[test]
+    fn test_coding_agent_signal_strength_wrapper_title_fallback_is_weaker() {
+        let pane = TmuxPane {
+            pane_id: "%1".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s".to_string(),
+            cwd: "/tmp".to_string(),
+            running_cmd: Some("bash".to_string()),
+            pane_title: Some("claude".to_string()),
+            pane_dead: false,
+        };
+        assert_eq!(coding_agent_signal_strength(&pane), 1);
+    }
+
+    #[test]
+    fn test_select_active_agent_pane_keeps_unmatched_wrapper_claude_title_fallback() {
+        let pane = TmuxPane {
+            pane_id: "%1".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s1".to_string(),
+            cwd: "/tmp/a".to_string(),
+            running_cmd: Some("bash".to_string()),
+            pane_title: Some("claude".to_string()),
+            pane_dead: false,
+        };
+
+        let ws = TmuxWorkspace {
+            sessions: vec![TmuxSession {
+                name: "s1".to_string(),
+                group: None,
+                panes: vec![pane],
+            }],
+            total_panes: 1,
+        };
+
+        let key = PaneKey {
+            session: "s1".to_string(),
+            window: "w".to_string(),
+            pane: "%1".to_string(),
+        };
+
+        let state = AppState {
+            tmux_workspace: Some(ws),
+            selected_pane_idx: 0,
+            agent_pane_count: 0,
+            sessions: vec![],
+            session_by_pane: HashMap::new(),
+            aggregated_tokens: AggregatedTokens::default(),
+            refresh_countdown: 0,
+            tmux_socket: None,
+        };
+
+        assert_eq!(select_active_agent_pane(&state).map(|(k, _)| k), Some(key));
+    }
+
+    #[test]
+    fn test_is_selectable_agent_pane_unmatched_wrapper_claude_is_selectable() {
+        let pane = TmuxPane {
+            pane_id: "%1".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s".to_string(),
+            cwd: "/tmp".to_string(),
+            running_cmd: Some("bash".to_string()),
+            pane_title: Some("claude".to_string()),
+            pane_dead: false,
+        };
+        assert!(is_selectable_agent_pane(&pane, false).is_some());
+    }
+
+    #[test]
+    fn test_is_selectable_agent_pane_unmatched_wrapper_codex_is_selectable() {
+        let pane = TmuxPane {
+            pane_id: "%1".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s".to_string(),
+            cwd: "/tmp".to_string(),
+            running_cmd: Some("bash".to_string()),
+            pane_title: Some("codex".to_string()),
+            pane_dead: false,
+        };
+        assert!(is_selectable_agent_pane(&pane, false).is_some());
+    }
+
+    #[test]
+    fn test_select_active_agent_pane_keeps_unmatched_wrapper_codex_title_fallback() {
+        let pane = TmuxPane {
+            pane_id: "%9".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s9".to_string(),
+            cwd: "/tmp/fallback".to_string(),
+            running_cmd: Some("bash".to_string()),
+            pane_title: Some("codex".to_string()),
+            pane_dead: false,
+        };
+
+        let ws = TmuxWorkspace {
+            sessions: vec![TmuxSession {
+                name: "s9".to_string(),
+                group: None,
+                panes: vec![pane],
+            }],
+            total_panes: 1,
+        };
+
+        let key = PaneKey {
+            session: "s9".to_string(),
+            window: "w".to_string(),
+            pane: "%9".to_string(),
+        };
+
+        let state = AppState {
+            tmux_workspace: Some(ws),
+            selected_pane_idx: 0,
+            agent_pane_count: 0,
+            sessions: vec![],
+            session_by_pane: HashMap::new(),
+            aggregated_tokens: AggregatedTokens::default(),
+            refresh_countdown: 0,
+            tmux_socket: None,
+        };
+
+        let selected = select_active_agent_pane(&state);
+        assert_eq!(selected.map(|(k, _)| k), Some(key));
+    }
+
+    #[test]
+    fn test_select_active_agent_pane_prefers_in_progress_session() {
+        let pane_active = TmuxPane {
+            pane_id: "%1".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s1".to_string(),
+            cwd: "/tmp/a".to_string(),
+            running_cmd: Some("claude".to_string()),
+            pane_title: Some("claude".to_string()),
+            pane_dead: false,
+        };
+
+        let pane_idle = TmuxPane {
+            pane_id: "%2".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s2".to_string(),
+            cwd: "/tmp/b".to_string(),
+            running_cmd: Some("claude".to_string()),
+            pane_title: Some("claude".to_string()),
+            pane_dead: false,
+        };
+
+        let ws = TmuxWorkspace {
+            sessions: vec![
+                TmuxSession {
+                    name: "s1".to_string(),
+                    group: None,
+                    panes: vec![pane_active.clone()],
+                },
+                TmuxSession {
+                    name: "s2".to_string(),
+                    group: None,
+                    panes: vec![pane_idle.clone()],
+                },
+            ],
+            total_panes: 2,
+        };
+
+        let key_active = PaneKey {
+            session: "s1".to_string(),
+            window: "w".to_string(),
+            pane: "%1".to_string(),
+        };
+        let key_idle = PaneKey {
+            session: "s2".to_string(),
+            window: "w".to_string(),
+            pane: "%2".to_string(),
+        };
+
+        let now = Utc::now();
+        let sessions = vec![
+            Session {
+                id: "active".to_string(),
+                project: "proj-a".to_string(),
+                project_path: "/tmp/a".to_string(),
+                cwd: "/tmp/a".to_string(),
+                git_branch: None,
+                status: SessionStatus::InProgress,
+                last_active: now,
+                message_counts: MessageCounts::default(),
+                token_counts: TokenCounts::default(),
+                queue_ops: vec![],
+                model: None,
+                last_user_msg: None,
+                last_asst_msg: None,
+            },
+            Session {
+                id: "idle".to_string(),
+                project: "proj-b".to_string(),
+                project_path: "/tmp/b".to_string(),
+                cwd: "/tmp/b".to_string(),
+                git_branch: None,
+                status: SessionStatus::Idle,
+                last_active: now,
+                message_counts: MessageCounts::default(),
+                token_counts: TokenCounts::default(),
+                queue_ops: vec![],
+                model: None,
+                last_user_msg: None,
+                last_asst_msg: None,
+            },
+        ];
+
+        let mut session_by_pane = HashMap::new();
+        session_by_pane.insert(key_active.clone(), 0);
+        session_by_pane.insert(key_idle, 1);
+
+        let state = AppState {
+            tmux_workspace: Some(ws),
+            selected_pane_idx: 0,
+            agent_pane_count: 0,
+            sessions,
+            session_by_pane,
+            aggregated_tokens: AggregatedTokens::default(),
+            refresh_countdown: 0,
+            tmux_socket: None,
+        };
+
+        let selected = select_active_agent_pane(&state);
+        assert_eq!(selected.map(|(k, _)| k), Some(key_active));
+    }
+
+    #[test]
+    fn test_select_active_agent_pane_prefers_jsonl_match_over_unmatched() {
+        let pane_matched = TmuxPane {
+            pane_id: "%1".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s1".to_string(),
+            cwd: "/tmp/a".to_string(),
+            running_cmd: Some("claude".to_string()),
+            pane_title: Some("shell".to_string()),
+            pane_dead: false,
+        };
+
+        let pane_unmatched = TmuxPane {
+            pane_id: "%2".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s2".to_string(),
+            cwd: "/tmp/b".to_string(),
+            running_cmd: Some("claude".to_string()),
+            pane_title: Some("claude".to_string()),
+            pane_dead: false,
+        };
+
+        let ws = TmuxWorkspace {
+            sessions: vec![
+                TmuxSession {
+                    name: "s1".to_string(),
+                    group: None,
+                    panes: vec![pane_matched.clone()],
+                },
+                TmuxSession {
+                    name: "s2".to_string(),
+                    group: None,
+                    panes: vec![pane_unmatched],
+                },
+            ],
+            total_panes: 2,
+        };
+
+        let key_matched = PaneKey {
+            session: "s1".to_string(),
+            window: "w".to_string(),
+            pane: "%1".to_string(),
+        };
+
+        let sessions = vec![Session {
+            id: "matched".to_string(),
+            project: "proj-a".to_string(),
+            project_path: "/tmp/a".to_string(),
+            cwd: "/tmp/a".to_string(),
+            git_branch: None,
+            status: SessionStatus::InProgress,
+            last_active: Utc::now(),
+            message_counts: MessageCounts::default(),
+            token_counts: TokenCounts::default(),
+            queue_ops: vec![],
+            model: None,
+            last_user_msg: None,
+            last_asst_msg: None,
+        }];
+
+        let mut session_by_pane = HashMap::new();
+        session_by_pane.insert(key_matched.clone(), 0);
+
+        let state = AppState {
+            tmux_workspace: Some(ws),
+            selected_pane_idx: 0,
+            agent_pane_count: 0,
+            sessions,
+            session_by_pane,
+            aggregated_tokens: AggregatedTokens::default(),
+            refresh_countdown: 0,
+            tmux_socket: None,
+        };
+
+        let selected = select_active_agent_pane(&state);
+        assert_eq!(selected.map(|(k, _)| k), Some(key_matched));
+    }
+
+    #[test]
+    fn test_select_active_agent_pane_uses_unmatched_agent_fallback() {
+        let pane = TmuxPane {
+            pane_id: "%9".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s9".to_string(),
+            cwd: "/tmp/fallback".to_string(),
+            running_cmd: Some("codex".to_string()),
+            pane_title: Some("codex".to_string()),
+            pane_dead: false,
+        };
+
+        let ws = TmuxWorkspace {
+            sessions: vec![TmuxSession {
+                name: "s9".to_string(),
+                group: None,
+                panes: vec![pane],
+            }],
+            total_panes: 1,
+        };
+
+        let key = PaneKey {
+            session: "s9".to_string(),
+            window: "w".to_string(),
+            pane: "%9".to_string(),
+        };
+
+        let state = AppState {
+            tmux_workspace: Some(ws),
+            selected_pane_idx: 0,
+            agent_pane_count: 0,
+            sessions: vec![],
+            session_by_pane: HashMap::new(),
+            aggregated_tokens: AggregatedTokens::default(),
+            refresh_countdown: 0,
+            tmux_socket: None,
+        };
+
+        let selected = select_active_agent_pane(&state);
+        assert_eq!(selected.map(|(k, _)| k), Some(key));
+    }
+
+    #[test]
+    fn test_select_active_agent_pane_prefers_pending_over_idle_when_no_in_progress() {
+        let pane_pending = TmuxPane {
+            pane_id: "%7".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "sp".to_string(),
+            cwd: "/tmp/p".to_string(),
+            running_cmd: Some("claude".to_string()),
+            pane_title: Some("claude".to_string()),
+            pane_dead: false,
+        };
+
+        let pane_idle = TmuxPane {
+            pane_id: "%8".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "si".to_string(),
+            cwd: "/tmp/i".to_string(),
+            running_cmd: Some("claude".to_string()),
+            pane_title: Some("claude".to_string()),
+            pane_dead: false,
+        };
+
+        let ws = TmuxWorkspace {
+            sessions: vec![
+                TmuxSession {
+                    name: "sp".to_string(),
+                    group: None,
+                    panes: vec![pane_pending],
+                },
+                TmuxSession {
+                    name: "si".to_string(),
+                    group: None,
+                    panes: vec![pane_idle],
+                },
+            ],
+            total_panes: 2,
+        };
+
+        let key_pending = PaneKey {
+            session: "sp".to_string(),
+            window: "w".to_string(),
+            pane: "%7".to_string(),
+        };
+        let key_idle = PaneKey {
+            session: "si".to_string(),
+            window: "w".to_string(),
+            pane: "%8".to_string(),
+        };
+
+        let now = Utc::now();
+        let sessions = vec![
+            Session {
+                id: "pending".to_string(),
+                project: "proj-p".to_string(),
+                project_path: "/tmp/p".to_string(),
+                cwd: "/tmp/p".to_string(),
+                git_branch: None,
+                status: SessionStatus::Pending,
+                last_active: now,
+                message_counts: MessageCounts::default(),
+                token_counts: TokenCounts::default(),
+                queue_ops: vec![],
+                model: None,
+                last_user_msg: None,
+                last_asst_msg: None,
+            },
+            Session {
+                id: "idle".to_string(),
+                project: "proj-i".to_string(),
+                project_path: "/tmp/i".to_string(),
+                cwd: "/tmp/i".to_string(),
+                git_branch: None,
+                status: SessionStatus::Idle,
+                last_active: now,
+                message_counts: MessageCounts::default(),
+                token_counts: TokenCounts::default(),
+                queue_ops: vec![],
+                model: None,
+                last_user_msg: None,
+                last_asst_msg: None,
+            },
+        ];
+
+        let mut session_by_pane = HashMap::new();
+        session_by_pane.insert(key_pending.clone(), 0);
+        session_by_pane.insert(key_idle, 1);
+
+        let state = AppState {
+            tmux_workspace: Some(ws),
+            selected_pane_idx: 0,
+            agent_pane_count: 0,
+            sessions,
+            session_by_pane,
+            aggregated_tokens: AggregatedTokens::default(),
+            refresh_countdown: 0,
+            tmux_socket: None,
+        };
+
+        let selected = select_active_agent_pane(&state);
+        assert_eq!(selected.map(|(k, _)| k), Some(key_pending));
+    }
+
+    #[test]
+    fn test_select_active_agent_pane_uses_idle_match_when_no_in_progress() {
+        let pane = TmuxPane {
+            pane_id: "%1".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s".to_string(),
+            cwd: "/tmp/a".to_string(),
+            running_cmd: Some("claude".to_string()),
+            pane_title: Some("claude".to_string()),
+            pane_dead: false,
+        };
+
+        let ws = TmuxWorkspace {
+            sessions: vec![TmuxSession {
+                name: "s".to_string(),
+                group: None,
+                panes: vec![pane],
+            }],
+            total_panes: 1,
+        };
+
+        let key = PaneKey {
+            session: "s".to_string(),
+            window: "w".to_string(),
+            pane: "%1".to_string(),
+        };
+
+        let sessions = vec![Session {
+            id: "idle".to_string(),
+            project: "proj-a".to_string(),
+            project_path: "/tmp/a".to_string(),
+            cwd: "/tmp/a".to_string(),
+            git_branch: None,
+            status: SessionStatus::Idle,
+            last_active: Utc::now(),
+            message_counts: MessageCounts::default(),
+            token_counts: TokenCounts::default(),
+            queue_ops: vec![],
+            model: None,
+            last_user_msg: None,
+            last_asst_msg: None,
+        }];
+
+        let mut session_by_pane = HashMap::new();
+        session_by_pane.insert(key.clone(), 0);
+
+        let state = AppState {
+            tmux_workspace: Some(ws),
+            selected_pane_idx: 0,
+            agent_pane_count: 0,
+            sessions,
+            session_by_pane,
+            aggregated_tokens: AggregatedTokens::default(),
+            refresh_countdown: 0,
+            tmux_socket: None,
+        };
+
+        let selected = select_active_agent_pane(&state);
+        assert_eq!(selected.map(|(k, _)| k), Some(key));
+    }
+
+    #[test]
+    fn test_active_agent_candidates_respects_in_progress_priority() {
+        let pane_in_progress = TmuxPane {
+            pane_id: "%2".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s1".to_string(),
+            cwd: "/tmp/a".to_string(),
+            running_cmd: Some("claude".to_string()),
+            pane_title: Some("claude".to_string()),
+            pane_dead: false,
+        };
+
+        let pane_pending = TmuxPane {
+            pane_id: "%1".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s2".to_string(),
+            cwd: "/tmp/b".to_string(),
+            running_cmd: Some("claude".to_string()),
+            pane_title: Some("claude".to_string()),
+            pane_dead: false,
+        };
+
+        let ws = TmuxWorkspace {
+            sessions: vec![
+                TmuxSession {
+                    name: "s1".to_string(),
+                    group: None,
+                    panes: vec![pane_in_progress],
+                },
+                TmuxSession {
+                    name: "s2".to_string(),
+                    group: None,
+                    panes: vec![pane_pending],
+                },
+            ],
+            total_panes: 2,
+        };
+
+        let key_in_progress = PaneKey {
+            session: "s1".to_string(),
+            window: "w".to_string(),
+            pane: "%2".to_string(),
+        };
+
+        let key_pending = PaneKey {
+            session: "s2".to_string(),
+            window: "w".to_string(),
+            pane: "%1".to_string(),
+        };
+
+        let now = Utc::now();
+        let sessions = vec![
+            Session {
+                id: "in_progress".to_string(),
+                project: "proj-a".to_string(),
+                project_path: "/tmp/a".to_string(),
+                cwd: "/tmp/a".to_string(),
+                git_branch: None,
+                status: SessionStatus::InProgress,
+                last_active: now,
+                message_counts: MessageCounts::default(),
+                token_counts: TokenCounts::default(),
+                queue_ops: vec![],
+                model: None,
+                last_user_msg: None,
+                last_asst_msg: None,
+            },
+            Session {
+                id: "pending".to_string(),
+                project: "proj-b".to_string(),
+                project_path: "/tmp/b".to_string(),
+                cwd: "/tmp/b".to_string(),
+                git_branch: None,
+                status: SessionStatus::Pending,
+                last_active: now,
+                message_counts: MessageCounts::default(),
+                token_counts: TokenCounts::default(),
+                queue_ops: vec![],
+                model: None,
+                last_user_msg: None,
+                last_asst_msg: None,
+            },
+        ];
+
+        let mut session_by_pane = HashMap::new();
+        session_by_pane.insert(key_in_progress.clone(), 0);
+        session_by_pane.insert(key_pending, 1);
+
+        let state = AppState {
+            tmux_workspace: Some(ws),
+            selected_pane_idx: 0,
+            agent_pane_count: 0,
+            sessions,
+            session_by_pane,
+            aggregated_tokens: AggregatedTokens::default(),
+            refresh_countdown: 0,
+            tmux_socket: None,
+        };
+
+        let candidates = active_agent_candidates(&state);
+        assert_eq!(candidates.first().map(|(k, _, _, _, _)| k.clone()), Some(key_in_progress));
+    }
+
+    #[test]
+    fn test_resolve_selected_index_keeps_same_pane_when_order_changes() {
+        let previous = vec![
+            PaneKey {
+                session: "s".to_string(),
+                window: "w".to_string(),
+                pane: "%1".to_string(),
+            },
+            PaneKey {
+                session: "s".to_string(),
+                window: "w".to_string(),
+                pane: "%2".to_string(),
+            },
+        ];
+
+        let reordered = vec![
+            PaneKey {
+                session: "s".to_string(),
+                window: "w".to_string(),
+                pane: "%2".to_string(),
+            },
+            PaneKey {
+                session: "s".to_string(),
+                window: "w".to_string(),
+                pane: "%1".to_string(),
+            },
+        ];
+
+        assert_eq!(resolve_selected_index(&previous, 0, &reordered), 1);
+        assert_eq!(resolve_selected_index(&previous, 1, &reordered), 0);
+    }
+
+    #[test]
+    fn test_resolve_selected_index_clamps_when_previous_missing() {
+        let previous = vec![PaneKey {
+            session: "s".to_string(),
+            window: "w".to_string(),
+            pane: "%3".to_string(),
+        }];
+
+        let current = vec![
+            PaneKey {
+                session: "s".to_string(),
+                window: "w".to_string(),
+                pane: "%1".to_string(),
+            },
+            PaneKey {
+                session: "s".to_string(),
+                window: "w".to_string(),
+                pane: "%2".to_string(),
+            },
+        ];
+
+        assert_eq!(resolve_selected_index(&previous, 5, &current), 1);
+    }
+
+    #[test]
+    fn test_select_active_agent_pane_sorts_numeric_pane_ids() {
+        let pane_two = TmuxPane {
+            pane_id: "%2".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s".to_string(),
+            cwd: "/tmp/a".to_string(),
+            running_cmd: Some("claude".to_string()),
+            pane_title: Some("claude".to_string()),
+            pane_dead: false,
+        };
+
+        let pane_ten = TmuxPane {
+            pane_id: "%10".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s".to_string(),
+            cwd: "/tmp/a".to_string(),
+            running_cmd: Some("claude".to_string()),
+            pane_title: Some("claude".to_string()),
+            pane_dead: false,
+        };
+
+        let ws = TmuxWorkspace {
+            sessions: vec![TmuxSession {
+                name: "s".to_string(),
+                group: None,
+                panes: vec![pane_ten, pane_two],
+            }],
+            total_panes: 2,
+        };
+
+        let key_two = PaneKey {
+            session: "s".to_string(),
+            window: "w".to_string(),
+            pane: "%2".to_string(),
+        };
+
+        let key_ten = PaneKey {
+            session: "s".to_string(),
+            window: "w".to_string(),
+            pane: "%10".to_string(),
+        };
+
+        let now = Utc::now();
+        let sessions = vec![
+            Session {
+                id: "a".to_string(),
+                project: "proj-a".to_string(),
+                project_path: "/tmp/a".to_string(),
+                cwd: "/tmp/a".to_string(),
+                git_branch: None,
+                status: SessionStatus::InProgress,
+                last_active: now,
+                message_counts: MessageCounts::default(),
+                token_counts: TokenCounts::default(),
+                queue_ops: vec![],
+                model: None,
+                last_user_msg: None,
+                last_asst_msg: None,
+            },
+            Session {
+                id: "b".to_string(),
+                project: "proj-a".to_string(),
+                project_path: "/tmp/a".to_string(),
+                cwd: "/tmp/a".to_string(),
+                git_branch: None,
+                status: SessionStatus::InProgress,
+                last_active: now,
+                message_counts: MessageCounts::default(),
+                token_counts: TokenCounts::default(),
+                queue_ops: vec![],
+                model: None,
+                last_user_msg: None,
+                last_asst_msg: None,
+            },
+        ];
+
+        let mut session_by_pane = HashMap::new();
+        session_by_pane.insert(key_ten.clone(), 0);
+        session_by_pane.insert(key_two.clone(), 1);
+
+        let first_state = AppState {
+            tmux_workspace: Some(ws.clone()),
+            selected_pane_idx: 0,
+            agent_pane_count: 2,
+            sessions: sessions.clone(),
+            session_by_pane: session_by_pane.clone(),
+            aggregated_tokens: AggregatedTokens::default(),
+            refresh_countdown: 0,
+            tmux_socket: None,
+        };
+
+        let second_state = AppState {
+            tmux_workspace: Some(ws),
+            selected_pane_idx: 1,
+            agent_pane_count: 2,
+            sessions,
+            session_by_pane,
+            aggregated_tokens: AggregatedTokens::default(),
+            refresh_countdown: 0,
+            tmux_socket: None,
+        };
+
+        assert_eq!(select_active_agent_pane(&first_state).map(|(k, _)| k), Some(key_two));
+        assert_eq!(select_active_agent_pane(&second_state).map(|(k, _)| k), Some(key_ten));
+    }
+
+    #[test]
+    fn test_select_active_agent_pane_respects_selected_index() {
+        let pane_a = TmuxPane {
+            pane_id: "%1".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s1".to_string(),
+            cwd: "/tmp/a".to_string(),
+            running_cmd: Some("claude".to_string()),
+            pane_title: Some("claude".to_string()),
+            pane_dead: false,
+        };
+
+        let pane_b = TmuxPane {
+            pane_id: "%2".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s2".to_string(),
+            cwd: "/tmp/b".to_string(),
+            running_cmd: Some("claude".to_string()),
+            pane_title: Some("claude".to_string()),
+            pane_dead: false,
+        };
+
+        let ws = TmuxWorkspace {
+            sessions: vec![
+                TmuxSession {
+                    name: "s1".to_string(),
+                    group: None,
+                    panes: vec![pane_a],
+                },
+                TmuxSession {
+                    name: "s2".to_string(),
+                    group: None,
+                    panes: vec![pane_b],
+                },
+            ],
+            total_panes: 2,
+        };
+
+        let key_a = PaneKey {
+            session: "s1".to_string(),
+            window: "w".to_string(),
+            pane: "%1".to_string(),
+        };
+        let key_b = PaneKey {
+            session: "s2".to_string(),
+            window: "w".to_string(),
+            pane: "%2".to_string(),
+        };
+
+        let now = Utc::now();
+        let sessions = vec![
+            Session {
+                id: "a".to_string(),
+                project: "proj-a".to_string(),
+                project_path: "/tmp/a".to_string(),
+                cwd: "/tmp/a".to_string(),
+                git_branch: None,
+                status: SessionStatus::InProgress,
+                last_active: now,
+                message_counts: MessageCounts::default(),
+                token_counts: TokenCounts::default(),
+                queue_ops: vec![],
+                model: None,
+                last_user_msg: None,
+                last_asst_msg: None,
+            },
+            Session {
+                id: "b".to_string(),
+                project: "proj-b".to_string(),
+                project_path: "/tmp/b".to_string(),
+                cwd: "/tmp/b".to_string(),
+                git_branch: None,
+                status: SessionStatus::InProgress,
+                last_active: now,
+                message_counts: MessageCounts::default(),
+                token_counts: TokenCounts::default(),
+                queue_ops: vec![],
+                model: None,
+                last_user_msg: None,
+                last_asst_msg: None,
+            },
+        ];
+
+        let mut session_by_pane = HashMap::new();
+        session_by_pane.insert(key_a.clone(), 0);
+        session_by_pane.insert(key_b.clone(), 1);
+
+        let state = AppState {
+            tmux_workspace: Some(ws),
+            selected_pane_idx: 1,
+            agent_pane_count: 2,
+            sessions,
+            session_by_pane,
+            aggregated_tokens: AggregatedTokens::default(),
+            refresh_countdown: 0,
+            tmux_socket: None,
+        };
+
+        let selected = select_active_agent_pane(&state);
+        assert_eq!(selected.map(|(k, _)| k), Some(key_b));
+    }
+
+    #[test]
+    fn test_build_tmux_tree_entries_includes_all_active_panes() {
+        let pane_one = TmuxPane {
+            pane_id: "%1".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s".to_string(),
+            cwd: "/tmp/a".to_string(),
+            running_cmd: Some("claude".to_string()),
+            pane_title: Some("claude".to_string()),
+            pane_dead: false,
+        };
+        let pane_two = TmuxPane {
+            pane_id: "%2".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s".to_string(),
+            cwd: "/tmp/a".to_string(),
+            running_cmd: Some("claude".to_string()),
+            pane_title: Some("claude".to_string()),
+            pane_dead: false,
+        };
+
+        let ws = TmuxWorkspace {
+            sessions: vec![TmuxSession {
+                name: "s".to_string(),
+                group: None,
+                panes: vec![pane_one, pane_two],
+            }],
+            total_panes: 2,
+        };
+
+        let state = AppState {
+            tmux_workspace: Some(ws),
+            selected_pane_idx: 0,
+            agent_pane_count: 2,
+            sessions: vec![],
+            session_by_pane: HashMap::new(),
+            aggregated_tokens: AggregatedTokens::default(),
+            refresh_countdown: 0,
+            tmux_socket: None,
+        };
+
+        let tree = build_tmux_tree_entries(&state);
+        let pane_entries = tree
+            .iter()
+            .filter(|e| matches!(e, TmuxTreeEntry::Pane { .. }))
+            .count();
+
+        assert_eq!(pane_entries, 2);
+        assert_eq!(tree.len(), 4); // Session + Window + 2 Panes
+    }
+
+    #[test]
+    fn test_build_tmux_tree_entries_keeps_window_hierarchy() {
+        let pane_one = TmuxPane {
+            pane_id: "%1".to_string(),
+            window_name: "w1".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s".to_string(),
+            cwd: "/tmp/a".to_string(),
+            running_cmd: Some("claude".to_string()),
+            pane_title: Some("claude".to_string()),
+            pane_dead: false,
+        };
+        let pane_two = TmuxPane {
+            pane_id: "%2".to_string(),
+            window_name: "w2".to_string(),
+            window_index: "1".to_string(),
+            session_name: "s".to_string(),
+            cwd: "/tmp/a".to_string(),
+            running_cmd: Some("claude".to_string()),
+            pane_title: Some("claude".to_string()),
+            pane_dead: false,
+        };
+
+        let ws = TmuxWorkspace {
+            sessions: vec![TmuxSession {
+                name: "s".to_string(),
+                group: None,
+                panes: vec![pane_one, pane_two],
+            }],
+            total_panes: 2,
+        };
+
+        let state = AppState {
+            tmux_workspace: Some(ws),
+            selected_pane_idx: 0,
+            agent_pane_count: 2,
+            sessions: vec![],
+            session_by_pane: HashMap::new(),
+            aggregated_tokens: AggregatedTokens::default(),
+            refresh_countdown: 0,
+            tmux_socket: None,
+        };
+
+        let tree = build_tmux_tree_entries(&state);
+        let window_entries = tree
+            .iter()
+            .filter(|e| matches!(e, TmuxTreeEntry::Window { .. }))
+            .count();
+
+        assert_eq!(window_entries, 2);
+        assert_eq!(tree.len(), 5); // Session + 2*(Window + Pane)
+    }
+
+    #[test]
+    fn test_build_tmux_tree_entries_groups_same_session_window_when_priorities_differ() {
+        let pane_matched = TmuxPane {
+            pane_id: "%1".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s".to_string(),
+            cwd: "/tmp/a".to_string(),
+            running_cmd: Some("claude".to_string()),
+            pane_title: Some("claude".to_string()),
+            pane_dead: false,
+        };
+        let pane_unmatched = TmuxPane {
+            pane_id: "%2".to_string(),
+            window_name: "w".to_string(),
+            window_index: "0".to_string(),
+            session_name: "s".to_string(),
+            cwd: "/tmp/other".to_string(),
+            running_cmd: Some("zsh".to_string()),
+            pane_title: Some("✳ Claude Code".to_string()),
+            pane_dead: false,
+        };
+
+        let ws = TmuxWorkspace {
+            sessions: vec![TmuxSession {
+                name: "s".to_string(),
+                group: None,
+                panes: vec![pane_unmatched, pane_matched],
+            }],
+            total_panes: 2,
+        };
+
+        let now = Utc::now();
+        let sessions = vec![Session {
+            id: "a".to_string(),
+            project: "proj-a".to_string(),
+            project_path: "/tmp/a".to_string(),
+            cwd: "/tmp/a".to_string(),
+            git_branch: Some("main".to_string()),
+            status: SessionStatus::InProgress,
+            last_active: now,
+            message_counts: MessageCounts::default(),
+            token_counts: TokenCounts::default(),
+            queue_ops: vec![],
+            model: None,
+            last_user_msg: None,
+            last_asst_msg: None,
+        }];
+
+        let key_matched = PaneKey {
+            session: "s".to_string(),
+            window: "w".to_string(),
+            pane: "%1".to_string(),
+        };
+        let mut session_by_pane = HashMap::new();
+        session_by_pane.insert(key_matched, 0);
+
+        let state = AppState {
+            tmux_workspace: Some(ws),
+            selected_pane_idx: 0,
+            agent_pane_count: 2,
+            sessions,
+            session_by_pane,
+            aggregated_tokens: AggregatedTokens::default(),
+            refresh_countdown: 0,
+            tmux_socket: None,
+        };
+
+        let tree = build_tmux_tree_entries(&state);
+        let window_entries = tree
+            .iter()
+            .filter(|e| matches!(e, TmuxTreeEntry::Window { .. }))
+            .count();
+        let pane_entries = tree
+            .iter()
+            .filter(|e| matches!(e, TmuxTreeEntry::Pane { .. }))
+            .count();
+
+        assert_eq!(window_entries, 1);
+        assert_eq!(pane_entries, 2);
+        assert_eq!(tree.len(), 4); // Session + Window + 2 Panes
     }
 }
